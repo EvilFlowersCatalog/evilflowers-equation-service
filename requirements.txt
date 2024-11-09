@@ -1,0 +1,6 @@
+python-dotenv
+pdf2image
+torch
+transformers
+python-Levenshtein
+nltk
