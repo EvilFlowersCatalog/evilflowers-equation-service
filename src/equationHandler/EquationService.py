@@ -19,7 +19,9 @@ class EquationHandler:
         """Pipeline for processing equations, when we have extracted latex"""
         pass
 
-    def extract_equations_from_image(self):
+    def extract_equations_from_image(self, python_code: bool = True):
         """Pipeline for processing equations, when we have extracted equations TODO: equation extraction is not implemented yet"""
-        equations = self.equation_extractor.extract_equations()
-        # return self.equation_processor.process_equations(equations)
+        latex_equations = self.equation_extractor.extract_equations()
+        if python_code:
+            python_equations = self.equation_processor.convert_latex_to_python_code(latex_equations)
+        return latex_equations, python_equations

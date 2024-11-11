@@ -24,7 +24,7 @@ class EquationExtractor:
         equations_list = []
         
         pages = self.extract_pages()
-        for page in pages:
+        for i, page in enumerate(pages[1:2]):  # Remove after testing
             equations = self.extract_equations_images_from_page(page)
             latex_equations = self._latex_extractor.extract_latex_equation(equations)
             equations_list.append(latex_equations)

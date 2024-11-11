@@ -1,4 +1,4 @@
-from equationHandler.EquationHandler import EquationHandler
+from equationHandler.EquationService import EquationHandler
 
 
 def main():
@@ -7,5 +7,6 @@ def main():
     return equation_handler.extract_equations_from_image()
 
 if __name__ == "__main__":
-    predictions = main()
-    print(predictions)
+    latex_equations, python_equations = main()
+    print("latex_equations", latex_equations)
+    print("python_equations", python_equations)

@@ -1,6 +1,8 @@
-python-dotenv
-pdf2image
-torch
-transformers
-python-Levenshtein
-nltk
+python-dotenv==1.0.1
+pdf2image==1.17.0
+torch==2.5.1
+transformers==4.46.2
+python-Levenshtein==0.22.0
+nltk==3.9.1
+antlr4-python3-runtime==4.11
+sympy==1.13.1

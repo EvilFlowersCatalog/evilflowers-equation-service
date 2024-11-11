@@ -16,29 +16,6 @@ class Nougat(ExtractorInterface):
         equations = self.filter_equations(image_latex)
         return equations
 
-    def filter_equations(self, latex: str) -> List[str]:
-        
-        # formatted_string = latex.replace("\\\\", "\\")
-
-        # Detect mathematical expressions
-        # - $$ ... $$ for display mode
-        # - \( ... \) for inline mode
-        # - \[ ... \] for display mode (another format)
-        math_pattern = r"\$\$(.*?)\$\$|\\\((.*?)\\\)|\\\[(.*?)\\\]"
-
-        # Find all matches
-        matches = re.findall(math_pattern, latex)
-        
-        # Extract the matched groups into a list of equations
-        equations = []
-        for match in matches:
-            # Each match is a tuple with groups; only one group will contain content per match
-            equations.append(next(group for group in match if group))
-
-        print(equations)
-        return equations
-
-
     def convert_image_to_latex(self, image: Image.Image) -> str:
         processor = NougatProcessor.from_pretrained("facebook/nougat-base")
         model = VisionEncoderDecoderModel.from_pretrained("facebook/nougat-base")
@@ -62,3 +39,26 @@ class Nougat(ExtractorInterface):
         latex_code = processor.post_process_generation(sequence, fix_markdown=False)
 
         return latex_code
+
+    def filter_equations(self, latex: str) -> List[str]:
+        
+        # formatted_string = latex.replace("\\\\", "\\")
+
+        # Detect mathematical expressions
+        # - $$ ... $$ for display mode
+        # - \( ... \) for inline mode
+        # - \[ ... \] for display mode (another format)
+        math_pattern = r"\$\$(.*?)\$\$|\\\((.*?)\\\)|\\\[(.*?)\\\]"
+
+        # Find all matches
+        matches = re.findall(math_pattern, latex)
+        
+        # Extract the matched groups into a list of equations
+        equations = []
+        for match in matches:
+            # Each match is a tuple with groups; only one group will contain content per match
+            equation = next(group for group in match if group)
+            equations.append(equation)
+
+
+        return equations
