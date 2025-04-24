@@ -6,3 +6,6 @@ python-Levenshtein==0.22.0
 nltk==3.9.1
 antlr4-python3-runtime==4.11
 sympy==1.13.1
+
+# Kafka
+confluent-kafka
