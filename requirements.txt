@@ -7,5 +7,8 @@ nltk==3.9.1
 antlr4-python3-runtime==4.11
 sympy==1.13.1
 
-# Kafka
-confluent-kafka
+# Elasticsearch
+elasticsearch
+kibana
+git+https://github.com/0Kozlik0/EvilFlowerElasticsearch.git@main#egg=elvira_elasticsearch_client
+confluent_kafka

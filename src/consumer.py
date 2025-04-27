@@ -3,6 +3,8 @@ from config.consumer_config import consumer_conf, consumer_subscriptions
 from equationHandler.EquationService import EquationHandler
 import json
 
+from elvira_elasticsearch_client import ElasticsearchClient 
+
 class MyConsumer(DefaultConsumer):
     def msg_process(self, msg):
         
@@ -14,6 +16,9 @@ class MyConsumer(DefaultConsumer):
         
         print("latex_equations", latex_equations)
         print("python_equations", python_equations)
+
+        client = ElasticsearchClient()
+        client.save_extracted_equations_to_elasticsearch()
 
 if __name__ == "__main__":
     consumer = MyConsumer(consumer_conf, consumer_subscriptions)
