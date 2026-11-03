@@ -1,14 +1,8 @@
-python-dotenv==1.0.1
-pdf2image==1.17.0
-torch==2.5.1
-transformers==4.46.2
-python-Levenshtein==0.22.0
-nltk==3.9.1
-antlr4-python3-runtime==4.11
-sympy==1.13.1
-
-# Elasticsearch
-elasticsearch
-kibana
-git+https://github.com/0Kozlik0/EvilFlowerElasticsearch.git@main#egg=elvira_elasticsearch_client
-confluent_kafka
+python-dotenv>=1.0
+celery[redis]>=5.4
+requests>=2.32
+pymupdf>=1.24
+pillow>=10.4
+rapid-latex-ocr>=0.0.9
+sympy>=1.13
+antlr4-python3-runtime==4.11.*

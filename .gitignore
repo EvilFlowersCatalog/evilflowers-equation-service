@@ -3,4 +3,4 @@
 __pycache__
 
 test_data/
-.env
+.env.pytest_cache
