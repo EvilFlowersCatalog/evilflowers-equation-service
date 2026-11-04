@@ -92,7 +92,15 @@ def normalize(latex: Optional[str]) -> Optional[str]:
         import sympy
         from sympy.parsing.latex import parse_latex
 
-        return sympy.latex(parse_latex(latex))
+        expr = parse_latex(latex)
+        # parse_latex keeps the expression unevaluated (2/4 stays 2/4) since sympy 1.14.
+        # Re-evaluating through sympify canonicalizes arithmetic without computing
+        # integrals or sums, which doit() would.
+        try:
+            expr = sympy.sympify(str(expr))
+        except Exception:
+            pass
+        return sympy.latex(expr)
     except Exception:
         return None
 
