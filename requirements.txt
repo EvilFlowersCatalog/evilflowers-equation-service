@@ -1,8 +1,0 @@
-python-dotenv>=1.0
-celery[redis]>=5.4
-requests>=2.32
-pymupdf>=1.24
-pillow>=10.4
-rapid-latex-ocr>=0.0.9
-sympy>=1.13
-antlr4-python3-runtime==4.11.*

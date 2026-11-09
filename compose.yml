@@ -1,0 +1,26 @@
+# Local development: Redis and the worker of this image. The catalog and the analyzer run from their own repos
+# and point at this Redis; STORAGE_PATH must be the same directory they read and write (./data here).
+# LaTeX-OCR weights are downloaded into ./models on the first equation.
+#
+#   docker compose up --build
+
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  equation:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/7
+      STORAGE_PATH: /mnt/data
+      LOG_FORMAT: text
+    volumes:
+      - ./data:/mnt/data
+      - ./models:/models
+    depends_on:
+      - redis

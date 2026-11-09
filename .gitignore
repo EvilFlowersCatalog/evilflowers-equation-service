@@ -1,6 +1,12 @@
 .venv
 .DS_Store
 __pycache__
+.pytest_cache
+.ruff_cache
+.env
+.idea
 
 test_data/
-.env.pytest_cache
+data/
+models/
+.mcp.json
