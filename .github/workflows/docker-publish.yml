@@ -52,9 +52,10 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      # Core + dev group only (pyproject.toml): no rapid-latex-ocr/OpenCV, no exporters, no Pyroscope.
+      # Core + dev group + rapid-latex-ocr (tests/test_latex.py guards how its ONNX sessions are built);
+      # no exporters, no Pyroscope.
       - name: Install
-        run: uv sync --locked
+        run: uv sync --locked --extra onnx
       - name: Lint
         run: |
           uv run ruff check

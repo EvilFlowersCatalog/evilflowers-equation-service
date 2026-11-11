@@ -73,11 +73,14 @@ class EquationsJob:
 
     def provenance(self) -> dict[str, Any]:
         """What produced the results, stored as `run.provenance["equations"]`."""
-        return {
+        provenance: dict[str, Any] = {
             "image": self.settings.image_tag,
             "latex_model": self.recognizer.name,
             "crop_dpi": self.settings.crop_dpi,
         }
+        if isinstance(self.recognizer, latex.OnnxRecognizer):
+            provenance["latex_threads"] = self.recognizer.threads
+        return provenance
 
     def _report_failure(self, error: Exception) -> None:
         # Report it, or the run waits for this job forever.

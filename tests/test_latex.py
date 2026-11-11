@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from PIL import Image
 
@@ -79,6 +81,86 @@ def test_onnx_weights_go_to_models_path(settings, tmp_path):
     downloaded = sorted(url.rsplit("/", 1)[1] for url in http.urls)
     assert downloaded == ["decoder.onnx", "image_resizer.onnx", "tokenizer.json"]
     assert not list(models.glob("*.partial"))
+
+
+@pytest.fixture
+def onnx_sessions(monkeypatch, tmp_path):
+    """Every ONNX Runtime session `LaTeXOCR` creates, without the real weights (`InferenceSession` is faked)."""
+    rlo_main = pytest.importorskip("rapid_latex_ocr.main")
+    from rapid_latex_ocr import utils_load
+
+    created = []
+
+    class FakeInferenceSession:
+        def __init__(self, path, sess_options=None, providers=None):
+            self.path = Path(path).name
+            self.sess_options = sess_options
+            created.append(self)
+
+        def get_session_options(self):
+            return self.sess_options
+
+    monkeypatch.setattr(utils_load, "InferenceSession", FakeInferenceSession)
+    monkeypatch.setattr(rlo_main, "TokenizerCls", lambda path: None)
+    models = tmp_path / "models"
+    models.mkdir()
+    for file_name in latex.OnnxRecognizer.FILES.values():
+        (models / file_name).write_bytes(b"weights")
+    return models, created
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_onnx_sessions_use_latex_threads(settings, onnx_sessions, threads):
+    models, created = onnx_sessions
+    config = {"models_path": models, "latex_threads": threads, "latex_allow_spinning": False}
+    latex.OnnxRecognizer(settings.model_copy(update=config))._load()
+
+    # rapid-latex-ocr 0.0.9 has three sessions; a new version that builds them elsewhere fails here.
+    assert sorted(session.path for session in created) == ["decoder.onnx", "encoder.onnx", "image_resizer.onnx"]
+    for session in created:
+        options = session.get_session_options()
+        assert options.intra_op_num_threads == threads
+        assert options.get_session_config_entry("session.intra_op.allow_spinning") == "0"
+
+    # The patch is undone after the constructor.
+    from rapid_latex_ocr import main
+    from rapid_latex_ocr import models as rlo_models
+    from rapid_latex_ocr.utils_load import OrtInferSession
+
+    assert main.OrtInferSession is OrtInferSession and rlo_models.OrtInferSession is OrtInferSession
+
+
+def test_onnx_sessions_keep_ort_defaults_without_latex_threads(settings, onnx_sessions):
+    models, created = onnx_sessions
+    latex.OnnxRecognizer(settings.model_copy(update={"models_path": models}))._load()
+
+    assert len(created) == 3
+    for session in created:
+        assert session.get_session_options().intra_op_num_threads == 0
+
+
+def test_onnx_counts_the_decoded_tokens(settings, onnx_sessions, caplog):
+    import numpy as np
+
+    models, _ = onnx_sessions
+    model = latex.OnnxRecognizer(settings.model_copy(update={"models_path": models, "latex_threads": 2}))
+    loaded = model._load()
+    loaded.encoder_decoder.inner = lambda x, temperature: np.zeros((1, 7), dtype=np.int64)
+    loaded.loop_image_resizer = lambda image: image
+    loaded.tokenizer = type("Tokenizer", (), {"token2str": staticmethod(lambda tokens: ["x ^ 2"])})()
+
+    with caplog.at_level("INFO", logger="evilflowers_equation.latex"):
+        assert model(Image.new("RGB", (20, 10), "white")) == "x^2"
+    assert model._tokens.last == 7
+    assert "7 tokens" in caplog.text
+
+
+def test_job_provenance_records_latex_threads(settings):
+    from evilflowers_equation.jobs import EquationsJob
+
+    onnx = latex.OnnxRecognizer(settings.model_copy(update={"latex_threads": 4}))
+    job = EquationsJob("run-1", "book.pdf", "out", [], settings=settings, catalog=None, recognizer=onnx)
+    assert job.provenance()["latex_threads"] == 4
 
 
 def test_a_failing_recognizer_gives_none():

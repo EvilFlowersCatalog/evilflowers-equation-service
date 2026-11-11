@@ -5,18 +5,22 @@ is loaded once per worker process, on the first crop.
 """
 
 import base64
+import functools
 import io
 import logging
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import ClassVar, Protocol
+from unittest.mock import patch
 
 import requests
 from PIL import Image
 
 from evilflowers_equation.clients.http import session
-from evilflowers_equation.observability import metrics, span
+from evilflowers_equation.observability import annotate, metrics, span
 from evilflowers_equation.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -106,8 +110,11 @@ class OnnxRecognizer:
 
     def __init__(self, settings: Settings, http: requests.Session | None = None):
         self.models_path = settings.models_path
+        self.threads = settings.latex_threads
+        self.allow_spinning = settings.latex_allow_spinning
         self.http = http or session()
         self._model = None
+        self._tokens: _TokenCounter | None = None
         self._lock = threading.Lock()
 
     def weights(self) -> dict[str, Path]:
@@ -137,16 +144,80 @@ class OnnxRecognizer:
     def _load(self):
         with self._lock:
             if self._model is None:
-                with span("latex.model.load", **{"latex.model": self.name}):
+                with span(
+                    "latex.model.load",
+                    **{"latex.model": self.name, "latex.threads": self.threads, "latex.spinning": self.allow_spinning},
+                ):
                     from rapid_latex_ocr import LaTeXOCR
 
-                    self._model = LaTeXOCR(**{argument: str(path) for argument, path in self.weights().items()})
+                    weights = {argument: str(path) for argument, path in self.weights().items()}
+                    with self._session_options():
+                        model = LaTeXOCR(**weights)
+                    self._tokens = model.encoder_decoder = _TokenCounter(model.encoder_decoder)
+                    self._model = model
             return self._model
 
+    @contextmanager
+    def _session_options(self) -> Iterator[None]:
+        """Apply `LATEX_THREADS` and `LATEX_ALLOW_SPINNING` to the sessions `LaTeXOCR` creates.
+
+        rapid_latex_ocr 0.0.9 builds its three sessions (`image_resizer` in `main`,
+        `encoder` and `decoder` in `models`) as `OrtInferSession(path)` and exposes no
+        thread count, so ORT sizes each pool from the node's cores, not the pod's limit.
+        The two modules' `OrtInferSession` is swapped for the duration of the constructor
+        only. That is why the package is pinned; `tests/test_latex.py` guards it.
+        """
+        if self.threads <= 0 and self.allow_spinning:
+            yield
+            return
+
+        from rapid_latex_ocr import main, models
+        from rapid_latex_ocr.utils_load import OrtInferSession
+
+        allow_spinning = self.allow_spinning
+
+        class Session(OrtInferSession):
+            def _init_sess_opt(self):
+                super()._init_sess_opt()
+                if not allow_spinning:
+                    self.sess_opt.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
+        factory = functools.partial(Session, num_threads=self.threads if self.threads > 0 else -1)
+        with patch.object(main, "OrtInferSession", factory), patch.object(models, "OrtInferSession", factory):
+            yield
+
     def __call__(self, image: Image.Image) -> str | None:
-        result = self._load()(png(image))
+        model = self._load()
+        started = time.perf_counter()
+        result = model(png(image))
+        tokens = self._tokens.last if self._tokens else None
+        if tokens is not None:
+            annotate(**{"latex.tokens": tokens})
+            logger.info("LaTeX-OCR: %d tokens in %.1f s", tokens, time.perf_counter() - started)
         # (latex, elapsed) in rapid_latex_ocr 0.x; a bare string in later versions.
         return clean(result[0] if isinstance(result, tuple | list) else str(result))
+
+
+class _TokenCounter:
+    """Wraps `LaTeXOCR.encoder_decoder` to keep the number of tokens the decoder produced for the last crop.
+
+    The decoder stops at the end token or after `max_seq_len` (512) steps, so the count
+    tells a crop that is slow per step from one that ran every step.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self._local = threading.local()
+
+    @property
+    def last(self) -> int | None:
+        return getattr(self._local, "tokens", None)
+
+    def __call__(self, x, **kwargs):
+        self._local.tokens = None
+        output = self.inner(x, **kwargs)
+        self._local.tokens = int(output.shape[-1])
+        return output
 
 
 class OllamaRecognizer:
@@ -185,7 +256,14 @@ _recognizers_lock = threading.Lock()
 
 def recognizer(settings: Settings) -> Recognizer:
     """The backend of `LATEX_BACKEND`, one per process (the ONNX model is loaded once)."""
-    key = (settings.latex_backend, str(settings.models_path), settings.ollama_endpoint, settings.latex_model)
+    key = (
+        settings.latex_backend,
+        str(settings.models_path),
+        settings.latex_threads,
+        settings.latex_allow_spinning,
+        settings.ollama_endpoint,
+        settings.latex_model,
+    )
     with _recognizers_lock:
         if key not in _recognizers:
             match settings.latex_backend:

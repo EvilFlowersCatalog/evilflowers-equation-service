@@ -21,9 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# LATEX_BACKEND=onnx: LaTeX-OCR (pix2tex) on ONNX Runtime, CPU. Imported lazily; the tests do not need it.
+# LATEX_BACKEND=onnx: LaTeX-OCR (pix2tex) on ONNX Runtime, CPU. Imported lazily; without it the tests that
+# guard its session wiring are skipped (CI installs it).
 onnx = [
-    # Pinned: `latex.OnnxRecognizer` passes the weight paths to its constructor.
+    # Pinned: `latex.OnnxRecognizer` passes the weight paths to its constructor and swaps the
+    # `OrtInferSession` of its `main` and `models` modules to set the thread count (LATEX_THREADS).
     "rapid-latex-ocr==0.0.9",
 ]
 # OTLP/HTTP to the node's Alloy; SDK/exporter 1.x and contrib 0.yb0 move together (as in the catalog).

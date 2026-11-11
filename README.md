@@ -41,6 +41,14 @@ The task name, queue and argument shape below are a contract with the caller (`t
 | `ollama` | A multimodal model behind an Ollama `/api/chat` endpoint (`OLLAMA_ENDPOINT`, `LATEX_MODEL`, `LATEX_TIMEOUT`). | `ollama:<model>` |
 | `none` | Crops and positions only. | `none` |
 
+Set `LATEX_THREADS` to the pod's CPU limit (`LATEX_THREADS=4`). rapid-latex-ocr does not set ONNX Runtime's
+thread count itself, so by default each of its three sessions starts one thread per core of the *node*. The decoder
+makes up to 512 tiny `run()` calls per crop, and 16 threads on a 2–4 core quota spend that quota on synchronisation:
+the container is throttled in nearly every CFS period, and a crop takes 30 s instead of about one. The value is
+recorded as `latex_threads` in the job's provenance. `LATEX_ALLOW_SPINNING=false` additionally stops idle pool threads
+from busy-waiting between calls. Each `latex.recognize` span carries `latex.tokens`, the number of tokens decoded (at
+most 512), and the same count is logged per crop.
+
 The model's LaTeX is what readers see (`latex`). sympy's canonical form goes into the region's `provenance.sympy`,
 and only when it differs.
 
@@ -83,7 +91,8 @@ their defaults and meaning. A deployment sets these:
 - `REDIS_URL` (default db 7) and `EQUATION_QUEUE` (default `evilflowers_equation`)
 - `STORAGE_PATH`, the catalog's storage root, mounted read/write
 - `CATALOG_API_URL` and `CATALOG_API_KEY`
-- `LATEX_BACKEND` and `MODELS_PATH` (a writable volume), or `OLLAMA_*` and `LATEX_MODEL`
+- `LATEX_BACKEND` and `MODELS_PATH` (a writable volume) and `LATEX_THREADS` (the CPU limit), or `OLLAMA_*` and
+  `LATEX_MODEL`
 - `IMAGE_TAG`, built in by CI
 
 ## Deployment

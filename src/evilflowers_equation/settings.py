@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     #: `onnx`: LaTeX-OCR (pix2tex) weights on ONNX Runtime, CPU, downloaded to `MODELS_PATH` on first use.
     #: `ollama`: a multimodal model behind an Ollama endpoint. `none`: crops and positions only.
     latex_backend: Literal["onnx", "ollama", "none"] = "onnx"
+    #: ONNX Runtime intra-op threads per session; match the pod's CPU limit. 0 = ORT default (all node cores).
+    #: The decoder makes up to 512 tiny `run()` calls per crop, and more threads than the CPU quota
+    #: mostly burn that quota on synchronisation (CFS throttling).
+    latex_threads: int = Field(0, ge=0)
+    #: ONNX Runtime's `session.intra_op.allow_spinning`. False makes idle pool threads sleep instead of
+    #: busy-waiting between the decoder's calls, which can help under a CPU quota. True is ORT's default.
+    latex_allow_spinning: bool = True
     models_path: Path = Path("/models/latex-ocr")
     ollama_endpoint: str = "http://ollama:11434/api/chat"
     ollama_api_key: SecretStr | None = None
