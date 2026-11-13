@@ -79,6 +79,95 @@ def test_a_run_the_catalog_refuses_stops_quietly(settings):
     assert catalog.reports == []
 
 
+def test_parallel_workers_keep_region_order_and_context(settings):
+    import threading
+    import time
+
+    from evilflowers_equation.observability.context import current
+
+    class SlowFirst:
+        """The first crop takes longest, so a pool that does not keep order would reorder it."""
+
+        name = "slow"
+
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.calls = 0
+            self.seen = []
+
+        def __call__(self, image):
+            with self.lock:
+                self.calls += 1
+                call = self.calls
+            time.sleep(0.05 if call == 1 else 0)
+            self.seen.append((threading.current_thread().name, dict(current())))
+            return f"x_{call}"
+
+    write_pdf(settings.storage_path / "book.pdf", pages=4)
+    catalog = FakeCatalog()
+    recognizer = SlowFirst()
+    regions = [region(page, page) for page in range(1, 5)]
+    outcome = job(settings.model_copy(update={"latex_workers": 3}), regions, catalog, recognizer).run()
+
+    assert outcome == "done"
+    assert [r.seq for r in catalog.regions_sent] == [1, 2, 3, 4]
+    assert sorted(r.latex for r in catalog.regions_sent) == ["x_1", "x_2", "x_3", "x_4"]
+    # Recognition ran on the pool, with the task's run_id still bound for its log lines.
+    assert all(name.startswith("latex") for name, _ in recognizer.seen)
+    assert all(fields.get("run_id") == "run-1" for _, fields in recognizer.seen)
+
+
+def test_a_slow_crop_does_not_stall_the_others(settings):
+    import threading
+
+    class OneSlow:
+        """The first call waits until every other crop is done, or gives up after 5 s."""
+
+        name = "slow"
+
+        def __init__(self, others):
+            self.others = others
+            self.condition = threading.Condition()
+            self.calls = 0
+            self.done = 0
+            self.waited_for_all = None
+
+        def __call__(self, image):
+            with self.condition:
+                self.calls += 1
+                first = self.calls == 1
+            if first:
+                with self.condition:
+                    self.waited_for_all = self.condition.wait_for(lambda: self.done == self.others, timeout=5)
+                return "slow"
+            with self.condition:
+                self.done += 1
+                self.condition.notify_all()
+            return "fast"
+
+    write_pdf(settings.storage_path / "book.pdf", pages=10)
+    catalog = FakeCatalog()
+    recognizer = OneSlow(others=9)
+    regions = [region(page, page) for page in range(1, 11)]
+    assert job(settings.model_copy(update={"latex_workers": 2}), regions, catalog, recognizer).run() == "done"
+
+    # 9 crops finished while one was stuck: more than the 2 x 2 that may wait rendered.
+    assert recognizer.waited_for_all is True
+    assert [r.seq for r in catalog.regions_sent] == list(range(1, 11))
+
+
+def test_a_cut_short_crop_is_marked_in_provenance(settings):
+    from evilflowers_equation.latex import Decoded
+
+    class Looping(FakeRecognizer):
+        last = Decoded(64, "repetition")
+
+    write_pdf(settings.storage_path / "book.pdf")
+    catalog = FakeCatalog()
+    job(settings, [region()], catalog, Looping("x")).run()
+    assert catalog.regions_sent[0].provenance == {"latex_model": "fake", "latex_stop": "repetition"}
+
+
 def test_no_regions_still_reports_done(settings):
     write_pdf(settings.storage_path / "book.pdf")
     catalog = FakeCatalog()

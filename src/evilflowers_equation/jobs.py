@@ -7,11 +7,16 @@ the catalog itself refused the run (409, `RunNotRunning`). A single region that
 fails is logged and skipped; the job still reports `done` with the others.
 """
 
+import contextvars
 import logging
+import threading
+from collections import deque
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Literal
 
 import pymupdf
+from PIL import Image
 from pydantic import TypeAdapter
 
 from evilflowers_equation import crops, latex
@@ -80,6 +85,9 @@ class EquationsJob:
         }
         if isinstance(self.recognizer, latex.OnnxRecognizer):
             provenance["latex_threads"] = self.recognizer.threads
+            provenance["latex_max_tokens"] = self.recognizer.max_tokens
+            provenance["latex_repetition_stop"] = self.recognizer.repetition_stop
+            provenance["latex_workers"] = self.settings.latex_workers
         return provenance
 
     def _report_failure(self, error: Exception) -> None:
@@ -99,44 +107,91 @@ class EquationsJob:
     # -- extraction -------------------------------------------------------------------------------
 
     def extract(self) -> list[Region]:
-        """Every region the analyzer found; one that fails is skipped. Raising fails the job."""
+        """Every region the analyzer found, in order; one that fails is skipped. Raising fails the job.
+
+        The task thread renders and saves each crop (PyMuPDF is not thread-safe) and
+        hands its recognition to `LATEX_WORKERS` threads; ONNX Runtime releases the GIL.
+        At most two crops per worker are rendered and not yet recognized, so a long book
+        does not pile up images in memory. The bound counts unfinished crops, not
+        uncollected ones: a slow crop at the head does not stall the others.
+        """
         regions = self._regions.validate_python(self.raw_regions)
+        workers = self.settings.latex_workers
         kept: list[Region] = []
+        pending: deque[tuple[LayoutRegion, str, Future]] = deque()
+        unfinished = threading.BoundedSemaphore(2 * workers)
+
+        def collect() -> None:
+            region, name, future = pending.popleft()
+            result = self._finish(region, name, future)
+            metrics.REGIONS.add(1, {"outcome": "kept" if result else "failed"})
+            if result is not None:
+                kept.append(result)
+
         with (
-            span("equations.extract", **{"equations.regions": len(regions)}) as current,
+            span("equations.extract", **{"equations.regions": len(regions), "latex.workers": workers}) as current,
             pymupdf.open(self.path) as document,
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix="latex") as pool,
         ):
             for region in regions:
+                unfinished.acquire()
                 try:
-                    result = self.equation(document, region)
+                    name, image = self.crop(document, region)
                 except Exception:
+                    unfinished.release()
                     logger.exception("Run %s: equation p%s/%s skipped", self.run_id, region.page, region.seq)
                     metrics.REGIONS.add(1, {"outcome": "failed"})
                     continue
-                metrics.REGIONS.add(1, {"outcome": "kept" if result else "skipped"})
-                if result is not None:
-                    kept.append(result)
+                if image is None:
+                    unfinished.release()
+                    metrics.REGIONS.add(1, {"outcome": "skipped"})
+                    continue
+                # A fresh copy each time: the span and the `bind` fields are context variables,
+                # and one Context cannot be entered by two threads at once.
+                future = pool.submit(contextvars.copy_context().run, self.transcribe, image)
+                future.add_done_callback(lambda _: unfinished.release())
+                pending.append((region, name, future))
+                # In order, as far as the crops are done.
+                while pending and pending[0][2].done():
+                    collect()
+            while pending:
+                collect()
             if current is not None:
                 current.set_attribute("equations.kept", len(kept))
         return kept
 
-    def equation(self, document: pymupdf.Document, region: LayoutRegion) -> Region | None:
-        """One region: crop, LaTeX, sympy's form. None for a crop too small to be a formula."""
+    def crop(self, document: pymupdf.Document, region: LayoutRegion) -> tuple[str, Image.Image | None]:
+        """Render and save one region's crop; no image for a crop too small to be a formula."""
         page = document[region.page - 1]
         image = crops.render(page, crops.rect(region.bbox, page), self.settings.crop_dpi)
-        if min(image.size) < self.settings.min_crop_pixels:
-            return None
-
         name = crops.crop_name(self.output_dir, region.page, region.seq)
+        if min(image.size) < self.settings.min_crop_pixels:
+            return name, None
         crops.save(image, self.settings.storage_path, name, self.settings.webp_quality)
+        return name, image
 
+    def transcribe(self, image: Image.Image) -> tuple[str | None, dict[str, Any]]:
+        """The crop's LaTeX and its provenance; runs on a worker thread."""
         source_latex = latex.recognize(self.recognizer, image)
         provenance: dict[str, Any] = {"latex_model": self.recognizer.name}
-        normalized = latex.normalize(source_latex)
+        # `last` is per thread; without LaTeX it may still describe this thread's previous crop.
+        decoded = getattr(self.recognizer, "last", None) if source_latex else None
+        if decoded is not None and decoded.stop != "eos":
+            # Cut short: a loop or the token cap. Kept so such LaTeX can be told apart.
+            provenance["latex_stop"] = decoded.stop
+        return source_latex, provenance
+
+    def _finish(self, region: LayoutRegion, name: str, future: Future) -> Region | None:
+        """The region once its LaTeX is in, with sympy's form (on the task thread: sympy holds the GIL)."""
+        try:
+            source_latex, provenance = future.result()
+            normalized = latex.normalize(source_latex)
+        except Exception:
+            logger.exception("Run %s: equation p%s/%s skipped", self.run_id, region.page, region.seq)
+            return None
         if normalized and normalized != source_latex:
             # The model's LaTeX is what is shown; sympy's form is kept for comparison and search.
             provenance["sympy"] = normalized
-
         return Region(
             page=region.page,
             seq=region.seq,

@@ -4,18 +4,22 @@
 is loaded once per worker process, on the first crop.
 """
 
+from __future__ import annotations
+
 import base64
 import functools
 import io
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Protocol
+from typing import ClassVar, Literal, Protocol
 from unittest.mock import patch
 
+import numpy as np
 import requests
 from PIL import Image
 
@@ -112,9 +116,11 @@ class OnnxRecognizer:
         self.models_path = settings.models_path
         self.threads = settings.latex_threads
         self.allow_spinning = settings.latex_allow_spinning
+        self.max_tokens = settings.latex_max_tokens
+        self.repetition_stop = settings.latex_repetition_stop
         self.http = http or session()
         self._model = None
-        self._tokens: _TokenCounter | None = None
+        self._decoder: GreedyDecoder | None = None
         self._lock = threading.Lock()
 
     def weights(self) -> dict[str, Path]:
@@ -153,7 +159,9 @@ class OnnxRecognizer:
                     weights = {argument: str(path) for argument, path in self.weights().items()}
                     with self._session_options():
                         model = LaTeXOCR(**weights)
-                    self._tokens = model.encoder_decoder = _TokenCounter(model.encoder_decoder)
+                    self._decoder = model.encoder_decoder = GreedyDecoder.replacing(
+                        model.encoder_decoder, self.max_tokens, self.repetition_stop
+                    )
                     self._model = model
             return self._model
 
@@ -186,38 +194,106 @@ class OnnxRecognizer:
         with patch.object(main, "OrtInferSession", factory), patch.object(models, "OrtInferSession", factory):
             yield
 
+    @property
+    def last(self) -> Decoded | None:
+        """How the decoder ended the last crop of the calling thread."""
+        return self._decoder.last if self._decoder else None
+
     def __call__(self, image: Image.Image) -> str | None:
         model = self._load()
         started = time.perf_counter()
         result = model(png(image))
-        tokens = self._tokens.last if self._tokens else None
-        if tokens is not None:
-            annotate(**{"latex.tokens": tokens})
-            logger.info("LaTeX-OCR: %d tokens in %.1f s", tokens, time.perf_counter() - started)
+        decoded = self.last
+        if decoded is not None:
+            annotate(**{"latex.tokens": decoded.tokens, "latex.stop": decoded.stop})
+            # Keep the "N tokens in S s" prefix: the Loki queries of #3 parse it.
+            suffix = "" if decoded.stop == "eos" else f", stopped by {decoded.stop}"
+            logger.info("LaTeX-OCR: %d tokens in %.1f s%s", decoded.tokens, time.perf_counter() - started, suffix)
         # (latex, elapsed) in rapid_latex_ocr 0.x; a bare string in later versions.
         return clean(result[0] if isinstance(result, tuple | list) else str(result))
 
 
-class _TokenCounter:
-    """Wraps `LaTeXOCR.encoder_decoder` to keep the number of tokens the decoder produced for the last crop.
+Stop = Literal["eos", "max_tokens", "repetition"]
 
-    The decoder stops at the end token or after `max_seq_len` (512) steps, so the count
-    tells a crop that is slow per step from one that ran every step.
+
+@dataclass(frozen=True)
+class Decoded:
+    #: Tokens produced, the end token included.
+    tokens: int
+    #: `eos`: the model finished. `max_tokens`: cut at `LATEX_MAX_TOKENS`. `repetition`: cut in a loop.
+    stop: Stop
+
+
+def repeats(tokens: Sequence[int], span: int, max_period: int = 8) -> int:
+    """The period (1 to `max_period` tokens) with which the last `span` tokens repeat, or 0.
+
+    A non-zero period is the decoder stuck in a loop (`\\qquad\\qquad…`, `e_{A},e_{A},…`).
+    Left alone it runs to the token cap; on dev those crops took 41 % of decode time (#3).
+    Replaying dev's stored LaTeX (re-tokenized, so an estimate), a span of 64 cuts ~30 %
+    of decode time, and ~55 of ~10,400 regions lose anything after the loop, nearly all
+    of it more garbage. Real content can repeat too (a long row of zeros is `0,` again
+    and again), which is why the span is long and nothing decoded is thrown away.
+    """
+    if span <= 0:
+        return 0
+    last = tokens[-span:]
+    for period in range(1, max_period + 1):
+        if len(tokens) >= span + period and last == tokens[-span - period : -period]:
+            return period
+    return 0
+
+
+class GreedyDecoder:
+    """Stands in for `LaTeXOCR.encoder_decoder`: the same encoder and decoder sessions, a cheaper loop.
+
+    rapid_latex_ocr's loop samples (top-k, softmax, `np.random.choice`) at temperature
+    1e-5, which is argmax with extra work and randomness. This one takes the argmax,
+    stops at `max_tokens` and when `repeats` sees a loop, and keeps how it ended per
+    thread. What it returns is always a prefix of what the full loop would decode. The
+    decoder graph has no KV cache, so each step still re-runs the whole prefix.
     """
 
-    def __init__(self, inner):
-        self.inner = inner
+    #: Positions the decoder graph takes (rapid_latex_ocr's `Decoder.max_seq_len`).
+    WINDOW = 512
+
+    def __init__(self, encoder, decoder, bos: int, eos: int, max_tokens: int, repetition_stop: int):
+        self.encoder = encoder
+        self.decoder = decoder
+        self.bos = bos
+        self.eos = eos
+        self.max_tokens = max_tokens
+        self.repetition_stop = repetition_stop
         self._local = threading.local()
 
-    @property
-    def last(self) -> int | None:
-        return getattr(self._local, "tokens", None)
+    @classmethod
+    def replacing(cls, inner, max_tokens: int, repetition_stop: int) -> GreedyDecoder:
+        """From rapid_latex_ocr 0.0.9's `EncoderDecoder`."""
+        return cls(inner.encoder, inner.decoder.session, inner.bos_token, inner.eos_token, max_tokens, repetition_stop)
 
-    def __call__(self, x, **kwargs):
-        self._local.tokens = None
-        output = self.inner(x, **kwargs)
-        self._local.tokens = int(output.shape[-1])
-        return output
+    @property
+    def last(self) -> Decoded | None:
+        return getattr(self._local, "decoded", None)
+
+    def __call__(self, x: np.ndarray, temperature: float | None = None) -> np.ndarray:
+        """Token ids of one image, shape (1, n); `temperature` is accepted and ignored."""
+        self._local.decoded = None
+        context = self.encoder([x])[0]
+        out = [self.bos]
+        stop: Stop = "max_tokens"
+        for _ in range(self.max_tokens):
+            window = np.array([out[-self.WINDOW :]], dtype=np.int64)
+            mask = np.ones_like(window, dtype=bool)
+            logits = self.decoder([window, mask, context])[0]
+            token = int(np.argmax(logits[0, -1]))
+            out.append(token)
+            if token == self.eos:
+                stop = "eos"
+                break
+            if repeats(out[1:], self.repetition_stop):
+                stop = "repetition"
+                break
+        self._local.decoded = Decoded(len(out) - 1, stop)
+        return np.array([out[1:]], dtype=np.int64)
 
 
 class OllamaRecognizer:
@@ -261,6 +337,8 @@ def recognizer(settings: Settings) -> Recognizer:
         str(settings.models_path),
         settings.latex_threads,
         settings.latex_allow_spinning,
+        settings.latex_max_tokens,
+        settings.latex_repetition_stop,
         settings.ollama_endpoint,
         settings.latex_model,
     )

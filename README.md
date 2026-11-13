@@ -46,8 +46,24 @@ thread count itself, so by default each of its three sessions starts one thread 
 makes up to 512 tiny `run()` calls per crop, and 16 threads on a 2–4 core quota spend that quota on synchronisation:
 the container is throttled in nearly every CFS period, and a crop takes 30 s instead of about one. The value is
 recorded as `latex_threads` in the job's provenance. `LATEX_ALLOW_SPINNING=false` additionally stops idle pool threads
-from busy-waiting between calls. Each `latex.recognize` span carries `latex.tokens`, the number of tokens decoded (at
-most 512), and the same count is logged per crop.
+from busy-waiting between calls.
+
+The service runs its own decode loop (`latex.GreedyDecoder`) over rapid-latex-ocr's ONNX sessions (#3):
+
+- **Greedy.** It takes the argmax. Upstream samples at temperature 1e-5, which is the same thing with more work. On
+  56 rendered images both gave identical LaTeX, and greedy was ~10 % faster per token.
+- **Loops are stopped.** Decoding stops once the last `LATEX_REPETITION_STOP` (64) tokens repeat one unit of 1 to 8
+  tokens (`\qquad\qquad…`). What was decoded is kept, so the output is a prefix of the full decode. Before this,
+  5.6 % of crops ran to the 512-token cap, and they took 41 % of decode time on dev. `LATEX_MAX_TOKENS` (512) is the
+  hard cap. A crop cut short has `provenance.latex_stop` (`repetition` or `max_tokens`).
+- **Crops in parallel.** `LATEX_WORKERS` crops of a book are decoded at once, one thread each. The task thread
+  renders the crops, because PyMuPDF is not thread-safe. With `LATEX_THREADS=1`, set `LATEX_WORKERS` to the CPU
+  limit. Locally, 3 workers × 1 thread did 1.4× the crops/s of 1 worker × 3 threads. That was on a 10-core Mac with
+  short formulas, not under the pod's quota.
+
+The decoder graph has no KV cache, so each step re-runs the whole prefix and time grows with the square of the
+length. Each `latex.recognize` span carries `latex.tokens` and `latex.stop`, and each crop logs
+`LaTeX-OCR: N tokens in S s`.
 
 The model's LaTeX is what readers see (`latex`). sympy's canonical form goes into the region's `provenance.sympy`,
 and only when it differs.
@@ -91,8 +107,8 @@ their defaults and meaning. A deployment sets these:
 - `REDIS_URL` (default db 7) and `EQUATION_QUEUE` (default `evilflowers_equation`)
 - `STORAGE_PATH`, the catalog's storage root, mounted read/write
 - `CATALOG_API_URL` and `CATALOG_API_KEY`
-- `LATEX_BACKEND` and `MODELS_PATH` (a writable volume) and `LATEX_THREADS` (the CPU limit), or `OLLAMA_*` and
-  `LATEX_MODEL`
+- `LATEX_BACKEND` and `MODELS_PATH` (a writable volume), with either `LATEX_THREADS` (the CPU limit) or
+  `LATEX_THREADS=1` plus `LATEX_WORKERS` (the CPU limit); or `OLLAMA_*` and `LATEX_MODEL`
 - `IMAGE_TAG`, built in by CI
 
 ## Deployment

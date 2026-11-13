@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     #: ONNX Runtime's `session.intra_op.allow_spinning`. False makes idle pool threads sleep instead of
     #: busy-waiting between the decoder's calls, which can help under a CPU quota. True is ORT's default.
     latex_allow_spinning: bool = True
+    #: Tokens decoded per crop at most; 512 is the decoder's window. A crop that reaches it is cut there.
+    latex_max_tokens: int = Field(512, ge=1, le=512)
+    #: Stop a crop once its last this-many tokens repeat a unit of 1 to 8 tokens (the decoder in a loop).
+    #: 0 turns it off. See `latex.repeats` for how 64 was chosen.
+    latex_repetition_stop: int = Field(64, ge=0)
+    #: Crops of one book decoded at the same time, each on its own thread. `Session.run` releases the
+    #: GIL, so with `LATEX_THREADS=1` this should match the pod's CPU limit (not the node's cores).
+    latex_workers: int = Field(1, ge=1)
     models_path: Path = Path("/models/latex-ocr")
     ollama_endpoint: str = "http://ollama:11434/api/chat"
     ollama_api_key: SecretStr | None = None
