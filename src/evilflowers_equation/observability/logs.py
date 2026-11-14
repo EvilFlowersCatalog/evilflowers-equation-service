@@ -31,9 +31,13 @@ class JsonFormatter(logging.Formatter):
             if context.is_valid:
                 payload["trace_id"] = format(context.trace_id, "032x")
                 payload["span_id"] = format(context.span_id, "016x")
+        fields = current()
         if (task := _current_task()) is not None:
             payload["task_name"], payload["task_id"] = task
-        payload.update({key: value for key, value in current().items() if key not in _RESERVED})
+        elif "task_id" in fields:
+            # A LaTeX worker thread has no Celery task of its own; the job bound the id (#6).
+            payload["task_id"] = fields["task_id"]
+        payload.update({key: value for key, value in fields.items() if key not in _RESERVED})
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)

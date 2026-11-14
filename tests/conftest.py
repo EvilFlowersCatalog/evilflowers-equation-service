@@ -1,7 +1,7 @@
 import pymupdf
 import pytest
 
-from evilflowers_equation.schemas import JobReport, Region
+from evilflowers_equation.schemas import JobReport, Region, RunState
 from evilflowers_equation.settings import Settings
 
 
@@ -12,12 +12,19 @@ def settings(tmp_path) -> Settings:
 
 
 class FakeCatalog:
-    """Records what a job sends; `fail_on` makes one call raise."""
+    """Records what a job sends; `fail_on` makes one call raise. `states` are what `run()` answers, in turn
+    (the last one repeats); by default a running run that waits for `equations`."""
 
-    def __init__(self, fail_on: dict[str, BaseException] | None = None):
+    def __init__(self, fail_on: dict[str, BaseException] | None = None, states: list[RunState] | None = None):
         self.regions_sent: list[Region] = []
         self.reports: list[tuple[str, JobReport]] = []
         self.fail_on = fail_on or {}
+        self.states = list(states or [RunState(status="running", jobs={"equations": "pending"})])
+        self.reads = 0
+
+    def run(self):
+        self.reads += 1
+        return self.states.pop(0) if len(self.states) > 1 else self.states[0]
 
     def regions(self, regions):
         if error := self.fail_on.get("regions"):
@@ -28,6 +35,20 @@ class FakeCatalog:
         if (error := self.fail_on.get("job")) and report.status == "done":
             raise error
         self.reports.append((name, report))
+
+
+class FakeDeliveries:
+    """`DeliveryCounter` in memory."""
+
+    def __init__(self, error: Exception | None = None):
+        self.counts: dict[str, int] = {}
+        self.error = error
+
+    def record(self, task_id):
+        if self.error:
+            raise self.error
+        self.counts[task_id] = self.counts.get(task_id, 0) + 1
+        return self.counts[task_id]
 
 
 class FakeRecognizer:

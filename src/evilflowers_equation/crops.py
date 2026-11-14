@@ -7,6 +7,7 @@ catalog serves and deletes them.
 """
 
 import io
+import math
 from pathlib import Path
 
 import pymupdf
@@ -19,6 +20,24 @@ def rect(box: Box, page: pymupdf.Page) -> pymupdf.Rect:
     """The box in the page's points."""
     width, height = page.rect.width, page.rect.height
     return pymupdf.Rect(box.x0 * width, box.y0 * height, box.x1 * width, box.y1 * height)
+
+
+def size(clip: pymupdf.Rect, dpi: int) -> tuple[int, int]:
+    """Width and height in pixels of `clip` rendered at `dpi`."""
+    scale = dpi / 72
+    return round(clip.width * scale), round(clip.height * scale)
+
+
+def bounded_dpi(clip: pymupdf.Rect, dpi: int, max_pixels: int) -> int:
+    """`dpi`, lowered so that `clip` renders to at most `max_pixels` pixels (0: no bound).
+
+    Worked out before rendering: the pixmap, its PNG and the PIL image of an oversized
+    box are what spikes the worker's memory past its limit (#6).
+    """
+    width, height = size(clip, dpi)
+    if max_pixels <= 0 or width * height <= max_pixels:
+        return dpi
+    return max(1, math.floor(dpi * math.sqrt(max_pixels / (width * height))))
 
 
 def render(page: pymupdf.Page, clip: pymupdf.Rect, dpi: int) -> Image.Image:

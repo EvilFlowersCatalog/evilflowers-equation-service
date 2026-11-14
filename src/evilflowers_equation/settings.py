@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     #: Seconds before Redis redelivers an unacknowledged message. The job acknowledges
     #: late, so this must outlast the longest book (LaTeX-OCR runs on CPU, region by region).
     broker_visibility_timeout: int = 7200
+    #: Seconds a SIGTERMed worker (scale-in, rollout) lets the running book continue before it cancels it
+    #: and Redis gets the message back (#4). Without it the book returned only after the visibility timeout.
+    worker_soft_shutdown_timeout: float = Field(10.0, ge=0)
+    #: Also wait `worker_soft_shutdown_timeout` when no task is running (Celery's `..._on_idle`).
+    worker_enable_soft_shutdown_on_idle: bool = False
+    #: Deliveries of one task id that may start the book (#6). The next one reports the job `failed`
+    #: without decoding: a book that kills the worker (OOM) every time would otherwise loop forever.
+    #: A SIGTERM requeue is not counted. 0 turns the cap off.
+    max_deliveries: int = Field(3, ge=0)
+    #: Seconds the delivery count of a task id is kept in Redis; longer than the visibility timeout.
+    delivery_ttl: int = Field(172800, ge=1)
 
     # -- Storage and provenance -----------------------------------------------------
     #: The catalog's storage root: originals are read here, crops written.
@@ -37,6 +48,10 @@ class Settings(BaseSettings):
     catalog_batch_size: int = 100
     catalog_attempts: int = 4
     catalog_timeout: float = 120.0
+    #: Seconds between reads of the run while a book is decoded (#5, catalog#140). The job stops when
+    #: the run is no longer `running`, was started again (a new `attempt`) or no longer waits for it. 0 = only once,
+    #: before the work.
+    run_check_interval: float = Field(300.0, ge=0)
 
     # -- Logs ---------------------------------------------------------------------------
     #: `json` (one object per line, what Loki parses) or `text` (Celery's own format, for a terminal).
@@ -47,6 +62,10 @@ class Settings(BaseSettings):
     webp_quality: int = 90
     #: A crop with a side shorter than this many pixels is dropped (a stray line, not a formula).
     min_crop_pixels: int = 4
+    #: Pixels a crop may have at most (#6). A larger box is rendered at a lower dpi so that it fits: a
+    #: whole A4 page at 200 dpi is 3.9 MP, a poster-sized page far more, while a wide display formula is
+    #: well under 1 MP and LaTeX-OCR shrinks its input below that anyway. 0 = no bound.
+    max_crop_pixels: int = Field(2_000_000, ge=0)
 
     # -- LaTeX recognition ------------------------------------------------------------------
     #: `onnx`: LaTeX-OCR (pix2tex) weights on ONNX Runtime, CPU, downloaded to `MODELS_PATH` on first use.

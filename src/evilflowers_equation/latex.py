@@ -24,7 +24,7 @@ import requests
 from PIL import Image
 
 from evilflowers_equation.clients.http import session
-from evilflowers_equation.observability import annotate, metrics, span
+from evilflowers_equation.observability import metrics, span
 from evilflowers_equation.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -205,7 +205,6 @@ class OnnxRecognizer:
         result = model(png(image))
         decoded = self.last
         if decoded is not None:
-            annotate(**{"latex.tokens": decoded.tokens, "latex.stop": decoded.stop})
             # Keep the "N tokens in S s" prefix: the Loki queries of #3 parse it.
             suffix = "" if decoded.stop == "eos" else f", stopped by {decoded.stop}"
             logger.info("LaTeX-OCR: %d tokens in %.1f s%s", decoded.tokens, time.perf_counter() - started, suffix)
@@ -355,12 +354,16 @@ def recognizer(settings: Settings) -> Recognizer:
 
 
 def recognize(model: Recognizer, image: Image.Image) -> str | None:
-    """Run the recognizer on one crop, timed and traced; a failure is logged and gives None."""
+    """Run the recognizer on one crop, timed; a failure is logged and gives None.
+
+    No span per crop: with per-batch tasks one book's trace holds hundreds of tasks, and a span per
+    region pushed text-service's traces over Tempo's size limit (#5). The duration histogram and the
+    `LaTeX-OCR: N tokens in S s` line cover each crop.
+    """
     started = time.perf_counter()
     outcome = "failed"
     try:
-        with span("latex.recognize", **{"latex.model": model.name}):
-            latex = model(image)
+        latex = model(image)
         outcome = "recognized" if latex else "empty"
         return latex
     except Exception:

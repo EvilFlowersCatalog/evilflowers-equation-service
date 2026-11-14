@@ -56,6 +56,9 @@ jobs:
       # no exporters, no Pyroscope.
       - name: Install
         run: uv sync --locked --extra onnx
+      # tests/test_worker.py starts a real Redis to prove the SIGTERM requeue and the delivery cap (#4, #6).
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server
       - name: Lint
         run: |
           uv run ruff check

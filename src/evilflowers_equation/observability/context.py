@@ -19,6 +19,8 @@ from evilflowers_equation.observability.otel import trace
 SPAN_ATTRIBUTES = {
     "run_id": "evilflowers.extraction.run_id",
     "job": "evilflowers.extraction.job",
+    "attempt": "evilflowers.extraction.attempt",
+    "task_id": "messaging.message.id",
     "source": "evilflowers.source",
 }
 

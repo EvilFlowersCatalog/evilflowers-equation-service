@@ -16,7 +16,13 @@ The task name, queue and argument shape below are a contract with the caller (`t
 
 | Task | Queue | Sent by | Does |
 |---|---|---|---|
-| `evilflowers_equation.equations` | `evilflowers_equation` | analyzer, kwargs `run_id, source, output_dir, regions` | For each region `{page, seq, bbox}` (page fractions, top-left origin), on every page: renders a crop at `CROP_DPI` into `<STORAGE_PATH>/<output_dir>/p041-eq02.webp`, transcribes it to LaTeX, and adds sympy's form where it parses and differs. Posts the regions to `/regions`, then reports the job. |
+| `evilflowers_equation.equations` | `evilflowers_equation` | analyzer, kwargs `run_id, source, output_dir, regions`, optional `job`, `attempt` | For each region `{page, seq, bbox}` (page fractions, top-left origin), on every page: renders a crop at `CROP_DPI` into `<STORAGE_PATH>/<output_dir>/p041-eq02.webp`, transcribes it to LaTeX, and adds sympy's form where it parses and differs. Posts the regions to `/regions`, then reports the job. |
+
+- **`job`** (#5): sent when the analyzer dispatches one task per layout batch (`DISPATCH_PER_BATCH`). The task
+  reports under that name (`/jobs/equations:0001-0008`) instead of `equations`. An empty batch (`regions: []`)
+  still reports. Metrics keep the kind (`job="equations"`), so their labels do not grow with page count.
+- **`attempt`** (EvilFlowersCatalog#140): sent whenever the catalog's `/start` returned one. Every ingestion call
+  then carries `?attempt=N`. A 409 is final and never retried, whether its reason is `superseded` or `not_running`.
 
 `evilflowers-analyzer-service` dispatches the job, and the job reports to the catalog's
 `/extraction/v1/runs/{run_id}/…` API with `CATALOG_API_KEY`. That key belongs to a catalog user holding
@@ -28,8 +34,45 @@ The task name, queue and argument shape below are a contract with the caller (`t
 - **A bad region is skipped, not fatal.** A region that cannot be cropped is logged and left out. If recognition
   fails, the crop is still kept, with `latex` empty.
 - **A 409 is the exception.** It means the catalog no longer accepts the run, and the job then stops quietly.
+- **The run is read first, and again while decoding.** `/regions` is not idempotent, so a copy of a task (a requeue,
+  or an analyzer that dispatched again) must not post twice. Before the work the job calls
+  `GET /extraction/v1/runs/<id>`, and repeats the call every `RUN_CHECK_INTERVAL` (300 s) before the next crop. It
+  stops in three cases:
+  - the run moved to a newer `attempt`, whether restarted or reset (`superseded`; reported as
+    `{"status": "superseded"}`);
+  - the run is not `running` (`not_running`);
+  - the run no longer waits for this job (`already_done`).
+
+  If the run cannot be read mid-book, the job logs it and decodes on. It also needs the catalog to post the results.
 - **Late acknowledgement.** The job acknowledges its message late, so a worker that dies mid-book has the book
   redelivered.
+
+### Stopping and killed workers
+
+- **SIGTERM requeues the book within seconds (#4).** A scale-in or rollout no longer waits for the book to finish.
+  The worker turns SIGTERM into Celery's cold shutdown with a soft-shutdown grace (`worker.requeue_on_sigterm`, what
+  `REMAP_SIGTERM=SIGQUIT` would do). It gives the book `WORKER_SOFT_SHUTDOWN_TIMEOUT` (10 s), then cancels the pool
+  child, and Redis gets the unacknowledged message back at once instead of after `BROKER_VISIBILITY_TIMEOUT`. Another
+  pod then starts the book from its first crop. This needs the prefork pool, which is what the image runs: under
+  `--pool=solo` SIGTERM stays a warm shutdown, because cancelling there would acknowledge and lose the message.
+  `tests/test_worker.py` proves the requeue against a real Redis. The pod's `terminationGracePeriodSeconds` only
+  has to outlast the soft timeout.
+- **A book that kills the worker is capped (#6).** A killed pool child (OOM) is requeued at once
+  (`task_reject_on_worker_lost`), and a killed container after the visibility timeout. Neither path leaves the task
+  a chance to acknowledge, and Celery's `redelivered` flag is False on both. So each start does
+  `INCR equation:deliveries:<task_id>` in Redis (kept `DELIVERY_TTL`, 48 h). The start after `MAX_DELIVERIES` (3)
+  reports the job `failed` (`TooManyDeliveries: started 4 times…`) without decoding, and the run can finish. A
+  SIGTERM requeue is taken back before the cancel (`worker.requeue_cold_shutdown`), so it does not count. If Redis
+  is unreachable, the counter is skipped; it never fails a book.
+- **Crops are bounded (#6).** A box that would render to more than `MAX_CROP_PIXELS` (2 MP) is rendered at a lower
+  dpi so that it fits: a whole A4 page at 200 dpi (3.9 MP), or a page of a poster-sized PDF. A wide display formula
+  stays well under the bound and keeps `CROP_DPI`. Each crop is logged with its page, box and
+  pixel size *before* it is rendered: if one kills the worker, it is the last line of the task.
+
+Chunked posting of a long book's regions (#4, second part) is not implemented. The catalog has no read-back of a
+run's regions and `/regions` does not upsert, so a requeued book could not skip what an earlier delivery posted
+without storing it twice. Per-batch tasks (#5) are the chunks instead: a requeue repeats one batch of
+`LAYOUT_BATCH_PAGES` pages, not a whole book.
 
 ## LaTeX
 
@@ -62,8 +105,7 @@ The service runs its own decode loop (`latex.GreedyDecoder`) over rapid-latex-oc
   short formulas, not under the pod's quota.
 
 The decoder graph has no KV cache, so each step re-runs the whole prefix and time grows with the square of the
-length. Each `latex.recognize` span carries `latex.tokens` and `latex.stop`, and each crop logs
-`LaTeX-OCR: N tokens in S s`.
+length. Each crop logs `LaTeX-OCR: N tokens in S s`. There is no span per crop (#5).
 
 The model's LaTeX is what readers see (`latex`). sympy's canonical form goes into the region's `provenance.sympy`,
 and only when it differs.
@@ -74,7 +116,8 @@ and only when it differs.
 src/evilflowers_equation/
 ├── worker.py          Celery app (`celery -A evilflowers_equation.worker worker`), config and routes
 ├── tasks.py           the thin Celery adapter of the `equations` job
-├── jobs.py            the IP-018 job protocol (extract → publish → report) and the equations job
+├── jobs.py            the IP-018 job protocol (check run → extract → publish → report) and the equations job
+├── deliveries.py      per-task delivery count in Redis, the cap on books that kill the worker
 ├── latex.py           recognizers (onnx, ollama, none), cleanup of model output, sympy normalization
 ├── crops.py           page geometry, rendering and WebP crops
 ├── schemas.py         messages received and payloads the catalog ingests (mirror of its forms)
@@ -136,20 +179,23 @@ The service follows the cluster's telemetry contract (knowledge base, `Cookbooks
 is off when its variables are unset.
 
 - **Traces.** Every task gets a CONSUMER span that continues the caller's trace. Every catalog or Ollama call gets a
-  CLIENT span carrying `traceparent`. Hand-made spans cover the extraction (`equations.extract`), the model download
-  and load (`latex.model.*`) and each recognition (`latex.recognize`). The endpoint comes from
+  CLIENT span carrying `traceparent`. Hand-made spans cover the extraction (`equations.extract`) and the model
+  download and load (`latex.model.*`). Spans are per task and per phase, never per region (#5): with per-batch tasks
+  one book's trace holds hundreds of tasks. The endpoint comes from
   `OTEL_EXPORTER_OTLP_ENDPOINT`, or from `HOST_IP` when only that is set; with neither, telemetry is off. The sampler
   is the SDK's standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`.
 - **Metrics** (Mimir):
   - `equation_task_duration_seconds`
-  - `equation_job_outcome_total{job,outcome}`
+  - `equation_job_outcome_total{job,outcome}` (`job` is always `equations`; `outcome`: `done`, `failed`,
+    `not_running`, `superseded`, `already_done`)
   - `equation_recognition_duration_seconds{model,outcome}`
   - `equation_regions_total{outcome}` (`kept`, `skipped`, `failed`)
   - `equation_document_regions`
   - `equation_catalog_retries_total`
   - process CPU and memory
 - **Logs.** Each log line is one JSON object on stdout. It carries `level`, `trace_id`/`span_id`,
-  `task_name`/`task_id`, and the task's `run_id`, `job` and `source`. Set `LOG_FORMAT=text` for a terminal.
+  `task_name`/`task_id`, and the task's `run_id`, `job`, `attempt` and `source`. `task_id` is also on the lines of
+  the LaTeX worker threads. Set `LOG_FORMAT=text` for a terminal.
 - **Profiles** (Pyroscope). The node's eBPF profiler cannot unwind Python on k3s `control`, so the worker profiles
   itself with the Pyroscope SDK when `PYROSCOPE_SERVER_ADDRESS` is set. It reads `PYROSCOPE_APPLICATION_NAME`
   (`equation`) and `PYROSCOPE_TAGS` (`k=v` pairs separated by commas). The profiler runs in the process that runs the

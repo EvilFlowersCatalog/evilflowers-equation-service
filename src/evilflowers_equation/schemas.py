@@ -46,7 +46,8 @@ class Region(BaseModel):
 
 
 class JobReport(BaseModel):
-    status: Literal["done", "failed"]
+    #: `superseded`: the job saw a newer attempt of its run and stopped (catalog#140); counted, the run is left alone.
+    status: Literal["done", "failed", "superseded"]
     error: str | None = None
     provenance: dict[str, Any] = Field(default_factory=dict)
 
@@ -54,6 +55,39 @@ class JobReport(BaseModel):
     @classmethod
     def _truncate(cls, value: str | None) -> str | None:
         return value[:MAX_ERROR_LENGTH] if value else None
+
+
+#: Why a job does not do (or stops doing) its work.
+#: `not_running`: the run no longer accepts results. `superseded`: the run was started again (a new attempt).
+#: `already_done`: the run no longer waits for this job (a copy of it reported, or it was never declared).
+SkipReason = Literal["not_running", "superseded", "already_done"]
+
+
+class RunState(BaseModel):
+    """What a job reads of its run (`GET /extraction/v1/runs/{id}`), before the work and between crops."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: str
+    #: `{job: pending | done | failed}`, as declared at the run's `/start`.
+    jobs: dict[str, str] = Field(default_factory=dict)
+    #: The current attempt (catalog#140); absent from catalogs that predate it.
+    attempt: int | None = None
+
+    def skip_reason(self, job: str, attempt: int | None = None) -> SkipReason | None:
+        """Why a job working for `attempt` must stop, or None while the run still waits for it.
+
+        The attempt is compared first, as the catalog does (`_require_running`): a reset run is
+        `queued` on a new attempt, and after a restart the job is `pending` again, but for the new
+        attempt, not for this task.
+        """
+        if attempt is not None and self.attempt is not None and self.attempt != attempt:
+            return "superseded"
+        if self.status != "running":
+            return "not_running"
+        if self.jobs.get(job) != "pending":
+            return "already_done"
+        return None
 
 
 def dump(model: BaseModel) -> dict[str, Any]:
