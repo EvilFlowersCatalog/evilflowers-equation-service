@@ -11,9 +11,8 @@ import math
 from pathlib import Path
 
 import pymupdf
+from evilflowers_worker.contract import Box
 from PIL import Image
-
-from evilflowers_equation.schemas import Box
 
 
 def rect(box: Box, page: pymupdf.Page) -> pymupdf.Rect:
@@ -50,8 +49,7 @@ def crop_name(output_dir: str, page: int, seq: int) -> str:
     return f"{output_dir.rstrip('/')}/p{page:03d}-eq{seq:02d}.webp"
 
 
-def save(image: Image.Image, storage_path: Path, name: str, quality: int) -> None:
-    """Write the crop under the storage root."""
-    path = storage_path / name
+def save(image: Image.Image, path: Path, quality: int) -> None:
+    """Write the crop to `path` (resolved under the storage root by `RuntimeSettings.storage_file`)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path, "WEBP", quality=quality, method=4)

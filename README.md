@@ -10,6 +10,11 @@ IP-018 extraction run. It takes each formula region the analyzer's layout pass f
 
 The results go back to the catalog as regions of kind `equation`.
 
+The worker runtime comes from [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker), pinned
+to a commit in `pyproject.toml` (`[tool.uv.sources]`). The kit provides the message contract, the catalog client,
+the job lifecycle (`LeafJob`), the Celery app, the scale-in shutdown, the delivery cap and the telemetry. Its design
+is in its `docs/architecture.md`. This repository holds only the domain: crops, LaTeX recognition and its thread pool.
+
 ## Tasks
 
 The task name, queue and argument shape below are a contract with the caller (`tests/test_worker.py` guards it).
@@ -29,11 +34,12 @@ The task name, queue and argument shape below are a contract with the caller (`t
 `extraction.ingest_extraction`.
 
 - **The job always reports `done` or `failed`.** A run finishes only when all of its declared jobs have reported
-  (`jobs.EquationsJob.run`). An unreadable PDF reports `failed`, and so does a catalog error that outlasts the
-  retries.
+  (`LeafJob.run` in the kit). An unreadable PDF reports `failed`, and so do a catalog error that outlasts the
+  retries, an `output_dir` that escapes `STORAGE_PATH`, and a message that does not validate (dropped, never retried).
 - **A bad region is skipped, not fatal.** A region that cannot be cropped is logged and left out. If recognition
   fails, the crop is still kept, with `latex` empty.
-- **A 409 is the exception.** It means the catalog no longer accepts the run, and the job then stops quietly.
+- **A 409 is the exception.** It means the catalog no longer accepts the run, and the job then stops quietly
+  (a `superseded` 409 is still reported as `{"status": "superseded"}`, which the catalog only counts).
 - **The run is read first, and again while decoding.** `/regions` is not idempotent, so a copy of a task (a requeue,
   or an analyzer that dispatched again) must not post twice. Before the work the job calls
   `GET /extraction/v1/runs/<id>`, and repeats the call every `RUN_CHECK_INTERVAL` (300 s) before the next crop. It
@@ -44,26 +50,28 @@ The task name, queue and argument shape below are a contract with the caller (`t
   - the run no longer waits for this job (`already_done`).
 
   If the run cannot be read mid-book, the job logs it and decodes on. It also needs the catalog to post the results.
+  `RUN_CHECK_INTERVAL=0` reads the run only once, before the work.
 - **Late acknowledgement.** The job acknowledges its message late, so a worker that dies mid-book has the book
   redelivered.
 
 ### Stopping and killed workers
 
-- **SIGTERM requeues the book within seconds (#4).** A scale-in or rollout no longer waits for the book to finish.
-  The worker turns SIGTERM into Celery's cold shutdown with a soft-shutdown grace (`worker.requeue_on_sigterm`, what
-  `REMAP_SIGTERM=SIGQUIT` would do). It gives the book `WORKER_SOFT_SHUTDOWN_TIMEOUT` (10 s), then cancels the pool
-  child, and Redis gets the unacknowledged message back at once instead of after `BROKER_VISIBILITY_TIMEOUT`. Another
-  pod then starts the book from its first crop. This needs the prefork pool, which is what the image runs: under
-  `--pool=solo` SIGTERM stays a warm shutdown, because cancelling there would acknowledge and lose the message.
-  `tests/test_worker.py` proves the requeue against a real Redis. The pod's `terminationGracePeriodSeconds` only
-  has to outlast the soft timeout.
+Both are the kit's (`evilflowers_worker.shutdown`, `evilflowers_worker.deliveries`, #7); the kit's own tests
+prove them against a real Redis, including a kill the pool is denied.
+
+- **SIGTERM requeues the book after a grace.** SIGTERM stays a warm shutdown. A book still running after
+  `WORKER_SOFT_SHUTDOWN_TIMEOUT` (60 s) is cancelled, and Redis gets the message back at once instead of after
+  `BROKER_VISIBILITY_TIMEOUT`. If that cancel is denied (the `PermissionError(13)` seen on dev), the worker restores
+  the message itself after `WORKER_CANCEL_TIMEOUT` (30 s) and exits. Another pod then starts the book from its first
+  crop. Keep `WORKER_SOFT_SHUTDOWN_TIMEOUT + WORKER_CANCEL_TIMEOUT` under the pod's `terminationGracePeriodSeconds`
+  (3 h), and do not set `REMAP_SIGTERM`.
 - **A book that kills the worker is capped (#6).** A killed pool child (OOM) is requeued at once
-  (`task_reject_on_worker_lost`), and a killed container after the visibility timeout. Neither path leaves the task
-  a chance to acknowledge, and Celery's `redelivered` flag is False on both. So each start does
-  `INCR equation:deliveries:<task_id>` in Redis (kept `DELIVERY_TTL`, 48 h). The start after `MAX_DELIVERIES` (3)
-  reports the job `failed` (`TooManyDeliveries: started 4 times…`) without decoding, and the run can finish. A
-  SIGTERM requeue is taken back before the cancel (`worker.requeue_cold_shutdown`), so it does not count. If Redis
-  is unreachable, the counter is skipped; it never fails a book.
+  (`reject_on_worker_lost`), and a killed container after the visibility timeout. Each redelivery adds one to
+  `evilflowers:deliveries:equation:<task_id>` in Redis; a fresh delivery starts at 1 again, because the catalog
+  re-sends a run under a stable task id. The delivery after `MAX_DELIVERIES` (3) reports the job `failed`
+  (`Gave up after 3 deliveries…`) without decoding, and the run can finish. A scale-in requeue gives its delivery
+  back, so it does not count. If Redis is unreachable, the delivery counts as the first; it never fails a book.
+  The old keys `equation:deliveries:<task_id>` are no longer read and expire on their own.
 - **Crops are bounded (#6).** A box that would render to more than `MAX_CROP_PIXELS` (2 MP) is rendered at a lower
   dpi so that it fits: a whole A4 page at 200 dpi (3.9 MP), or a page of a poster-sized PDF. A wide display formula
   stays well under the bound and keeps `CROP_DPI`. Each crop is logged with its page, box and
@@ -114,23 +122,24 @@ and only when it differs.
 
 ```
 src/evilflowers_equation/
-├── worker.py          Celery app (`celery -A evilflowers_equation.worker worker`), config and routes
-├── tasks.py           the thin Celery adapter of the `equations` job
-├── jobs.py            the IP-018 job protocol (check run → extract → publish → report) and the equations job
-├── deliveries.py      per-task delivery count in Redis, the cap on books that kill the worker
+├── worker.py          Celery app (`celery -A evilflowers_equation.worker worker`): the kit's `create_app("equation")`
+├── tasks.py           the `equations` task: `runtime.run_job(self, EquationsJob, RegionsJob, kwargs)`
+├── jobs.py            `EquationsJob(LeafJob[RegionsJob, list[Region]])`: crops, the LaTeX pool, provenance
 ├── latex.py           recognizers (onnx, ollama, none), cleanup of model output, sympy normalization
 ├── crops.py           page geometry, rendering and WebP crops
-├── schemas.py         messages received and payloads the catalog ingests (mirror of its forms)
-├── settings.py        typed settings from the environment (pydantic-settings)
-├── clients/           catalog ingestion API, shared HTTP session
-└── observability/     OpenTelemetry setup, spans, metrics, JSON logs, Pyroscope profiling, Celery signal wiring
+├── metrics.py         equation's own instruments (recognition, regions) on the kit's `Instrument`
+└── settings.py        `Settings(WorkerSettings)`: the queue, crop and LaTeX fields
 src/worker.py          deprecated shim for `celery --workdir src -A worker` (see Deployment)
 ```
 
 ## Development
 
 The project uses [uv](https://docs.astral.sh/uv/) and Python 3.12. It has three extras: `onnx` adds LaTeX-OCR,
-`otel` adds the OpenTelemetry SDK, and `profiling` adds the Pyroscope SDK. The image installs all three.
+`otel` adds the OpenTelemetry SDK, and `profiling` adds the Pyroscope SDK (the last two are the kit's extras). The
+image installs all three. `tests/test_worker.py` runs the app as a real prefork worker against Redis at
+`TEST_REDIS_URL` (default `redis://localhost:6379/15`) and is skipped without one, except in CI.
+
+To move to a newer kit, change `rev` in `[tool.uv.sources]` and run `uv lock --upgrade-package evilflowers-worker`.
 
 ```bash
 make install        # core + dev tools (ruff, pytest): enough for the tests
@@ -175,8 +184,8 @@ deploy prerequisites and the telemetry variables:
 
 ## Observability
 
-The service follows the cluster's telemetry contract (knowledge base, `Cookbooks/Deploy-a-Service` §3). All of it
-is off when its variables are unset.
+The service follows the cluster's telemetry contract (knowledge base, `Cookbooks/Deploy-a-Service` §3) through the
+kit's `evilflowers_worker.observability`. All of it is off when its variables are unset.
 
 - **Traces.** Every task gets a CONSUMER span that continues the caller's trace. Every catalog or Ollama call gets a
   CLIENT span carrying `traceparent`. Hand-made spans cover the extraction (`equations.extract`) and the model
@@ -192,6 +201,7 @@ is off when its variables are unset.
   - `equation_regions_total{outcome}` (`kept`, `skipped`, `failed`)
   - `equation_document_regions`
   - `equation_catalog_retries_total`
+  - `equation_deliveries_capped_total`
   - process CPU and memory
 - **Logs.** Each log line is one JSON object on stdout. It carries `level`, `trace_id`/`span_id`,
   `task_name`/`task_id`, and the task's `run_id`, `job`, `attempt` and `source`. `task_id` is also on the lines of

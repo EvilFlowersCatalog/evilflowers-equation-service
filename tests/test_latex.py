@@ -228,11 +228,14 @@ def test_repeats_finds_the_shortest_period():
 
 
 def test_job_provenance_records_latex_threads(settings):
+    from evilflowers_worker.contract import RegionsJob
+
     from evilflowers_equation.jobs import EquationsJob
 
     config = {"latex_threads": 4, "latex_workers": 3, "latex_max_tokens": 256}
     onnx = latex.OnnxRecognizer(settings.model_copy(update=config))
-    job = EquationsJob("run-1", "book.pdf", "out", [], settings=settings.model_copy(update=config), recognizer=onnx)
+    message = RegionsJob(run_id="run-1", source="book.pdf", output_dir="out")
+    job = EquationsJob(message, settings=settings.model_copy(update=config), recognizer=onnx)
     provenance = job.provenance()
     assert provenance["latex_threads"] == 4 and provenance["latex_workers"] == 3
     assert provenance["latex_max_tokens"] == 256 and provenance["latex_repetition_stop"] == 64

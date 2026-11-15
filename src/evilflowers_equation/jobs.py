@@ -1,184 +1,79 @@
-"""The IP-018 `equations` job: crop each formula region, transcribe it to LaTeX, post it, report the job.
+"""The IP-018 `equations` job: crop each formula region, transcribe it to LaTeX, post it.
 
-The analyzer dispatches the job and declares it at the run's `/start`; the run
-finishes only when every declared job has reported `done` or `failed`. So the
-job never ends silently: whatever goes wrong is reported to the catalog, unless
-the catalog itself refused the run (409). A single region that fails is logged
-and skipped; the job still reports `done` with the others.
+The lifecycle is the kit's ``LeafJob`` (``evilflowers_worker.jobs``): the delivery cap, the read of the
+run before the work (``already_done`` / ``not_running`` / ``superseded``), ``extract``, ``publish`` and
+the terminal report. This module is only the work: crops, the LaTeX thread pool and the provenance.
 
-The analyzer sends either one task per book, reported as `equations`, or one
-per layout batch with a `job` kwarg (`equations:0001-0008`, #5), reported under
-that name. Metrics keep the kind, `equations`, so their labels do not grow with
-page count.
+The analyzer sends either one task per book, reported as `equations`, or one per layout batch with a
+`job` kwarg (`equations:0001-0008`, #5), reported under that name. Metrics keep the kind, `equations`,
+so their labels do not grow with page count.
 
-A task can arrive more than once: a SIGTERM requeue, a killed worker, an
-analyzer that dispatched again. `/regions` is not idempotent, so before the work
-the job reads its run and does nothing unless the run is `running`, still on
-this task's `attempt` (catalog#140) and still waits for this job. It reads the
-run again every `RUN_CHECK_INTERVAL` while it decodes, and stops there too. And
-a task id that has already started `MAX_DELIVERIES` times is reported `failed`
-without decoding (#6, `deliveries`).
+A single region that fails is logged and skipped; the job still reports `done` with the others. The
+run is read again every `RUN_CHECK_INTERVAL` while the crops are decoded (``recheck``), and the job
+stops there when the run moves on.
 """
 
 import contextvars
 import logging
+import math
 import threading
-import time
 from collections import deque
-from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Literal
+from typing import Any
 
 import pymupdf
+from evilflowers_worker.catalog import CatalogClient
+from evilflowers_worker.contract import LayoutRegion, Region, RegionsJob
+from evilflowers_worker.jobs import LeafJob
+from evilflowers_worker.observability import span
 from PIL import Image
-from pydantic import TypeAdapter
 
-from evilflowers_equation import crops, latex
-from evilflowers_equation.clients.catalog import CatalogClient, RunNotRunning, RunSuperseded
-from evilflowers_equation.deliveries import DeliveryCounter
+from evilflowers_equation import crops, latex, metrics
 from evilflowers_equation.latex import Recognizer
-from evilflowers_equation.observability import bind, fail, metrics, span
-from evilflowers_equation.schemas import JobReport, LayoutRegion, Region, SkipReason
-from evilflowers_equation.settings import Settings, get_settings
+from evilflowers_equation.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-Outcome = Literal["done", "failed", "not_running", "superseded", "already_done"]
 
-
-class Stop(Exception):
-    """The run no longer wants this job's results; raised by `check`."""
-
-    def __init__(self, reason: SkipReason):
-        super().__init__(reason)
-        self.reason = reason
-
-
-class TooManyDeliveries(Exception):
-    """The task started more than `MAX_DELIVERIES` times; the earlier ones never finished."""
-
-
-class EquationsJob:
+class EquationsJob(LeafJob[RegionsJob, list[Region]]):
     #: The kind of job: its name in the catalog when the analyzer names no batch, and its metric label.
     kind = "equations"
-    _regions = TypeAdapter(list[LayoutRegion])
 
     def __init__(
         self,
-        run_id: str,
-        source: str,
-        output_dir: str,
-        regions: Sequence[dict],
+        message: RegionsJob,
         *,
-        job: str | None = None,
-        attempt: int | None = None,
-        task_id: str | None = None,
-        settings: Settings | None = None,
+        settings: Settings,
         catalog: CatalogClient | None = None,
+        task_id: str | None = None,
+        delivery: int = 1,
         recognizer: Recognizer | None = None,
-        deliveries: DeliveryCounter | None = None,
     ):
-        self.settings = settings or get_settings()
-        self.run_id = run_id
-        self.source = source
-        self.path = self.settings.source_path(source)
-        self.output_dir = output_dir
-        self.raw_regions = regions
-        #: The job's name in the catalog (`/jobs/<name>`, `run.provenance[<name>]`).
-        self.name = job or self.kind
-        self.attempt = attempt
-        self.task_id = task_id
-        self.catalog = catalog or CatalogClient(run_id, attempt=attempt, settings=self.settings)
-        self.recognizer = recognizer or latex.recognizer(self.settings)
-        self.deliveries = deliveries or DeliveryCounter(self.settings)
-        self._checked_at = 0.0
+        interval = settings.run_check_interval
+        super().__init__(
+            message,
+            settings=settings,
+            catalog=catalog,
+            task_id=task_id,
+            delivery=delivery,
+            # RUN_CHECK_INTERVAL=0 means "only before the work", not "before every crop".
+            recheck_interval=interval if interval > 0 else math.inf,
+        )
+        self.settings: Settings = settings
+        self.path = settings.source_path(message.source)
+        self.recognizer = recognizer or latex.recognizer(settings)
 
     # -- protocol ---------------------------------------------------------------------------------
 
-    def run(self) -> Outcome:
-        with bind(run_id=self.run_id, job=self.name, attempt=self.attempt, source=self.source, task_id=self.task_id):
-            try:
-                self.check()
-                self._count_delivery()
-                kept = self.extract()
-                self.catalog.regions(kept)
-                self.catalog.job(self.name, JobReport(status="done", provenance=self.provenance()))
-            except Stop as stop:
-                return self._stop(stop.reason)
-            except RunSuperseded:
-                logger.warning("Run %s was started again; attempt %s is superseded", self.run_id, self.attempt)
-                return self._outcome("superseded")
-            except RunNotRunning:
-                logger.warning("Run %s is not accepting results", self.run_id)
-                return self._outcome("not_running")
-            except Exception as error:
-                logger.exception("Job %s failed for run %s", self.name, self.run_id)
-                fail(error)
-                self._report_failure(error)
-                return self._outcome("failed")
-            metrics.DOCUMENT_REGIONS.record(len(kept))
-            logger.info("Run %s: %d of %d equations", self.run_id, len(kept), len(self.raw_regions))
-            return self._outcome("done")
-
-    def check(self) -> None:
-        """Read the run; raise `Stop` unless it is running, on this attempt and waiting for this job."""
-        state = self.catalog.run()
-        self._checked_at = time.monotonic()
-        if reason := state.skip_reason(self.name, self.attempt):
-            logger.warning(
-                "Stopping job %s for run %s: %s (run %s, attempt %s of %s, job %s)",
-                self.name,
-                self.run_id,
-                reason,
-                state.status,
-                self.attempt,
-                state.attempt,
-                state.jobs.get(self.name),
-            )
-            raise Stop(reason)
-
-    def _recheck(self) -> None:
-        """`check` again once `RUN_CHECK_INTERVAL` has passed; only `Stop` ends the book.
-
-        A catalog that cannot be read mid-book is logged and the book goes on: it only has to be up to
-        take the results, and failing hours of decoding over one missed read would be worse.
-        """
-        interval = self.settings.run_check_interval
-        if interval <= 0 or time.monotonic() - self._checked_at < interval:
-            return
-        try:
-            self.check()
-        except Stop:
-            raise
-        except Exception:
-            self._checked_at = time.monotonic()
-            logger.warning("Could not read run %s mid-book; decoding on", self.run_id, exc_info=True)
-
-    def _count_delivery(self) -> None:
-        """Raise `TooManyDeliveries` once this task id has started more than `MAX_DELIVERIES` times.
-
-        A Redis error is logged and ignored: the counter guards against a loop, it must not fail a book.
-        """
-        limit = self.settings.max_deliveries
-        if self.task_id is None or limit <= 0:
-            return
-        try:
-            count = self.deliveries.record(self.task_id)
-        except Exception:
-            logger.warning("Could not count the deliveries of task %s", self.task_id, exc_info=True)
-            return
-        if count > limit:
-            raise TooManyDeliveries(
-                f"started {count} times, and none of the {count - 1} before finished "
-                f"(the worker was killed, OOM?); not decoded again"
-            )
-        if count > 1:
-            logger.warning("Task %s: delivery %d of at most %d", self.task_id, count, limit)
+    def publish(self, result: list[Region]) -> None:
+        self.catalog.regions(result)
+        metrics.DOCUMENT_REGIONS.record(len(result))
+        logger.info("Run %s: %d of %d equations", self.message.run_id, len(result), len(self.message.regions))
 
     def provenance(self) -> dict[str, Any]:
         """What produced the results, stored as `run.provenance[<name>]`."""
         provenance: dict[str, Any] = {
-            "image": self.settings.image_tag,
+            **super().provenance(),
             "latex_model": self.recognizer.name,
             "crop_dpi": self.settings.crop_dpi,
         }
@@ -190,31 +85,6 @@ class EquationsJob:
             provenance["latex_repetition_stop"] = self.recognizer.repetition_stop
             provenance["latex_workers"] = self.settings.latex_workers
         return provenance
-
-    def _stop(self, reason: SkipReason) -> Outcome:
-        if reason == "superseded":
-            # Tells the catalog the work was saved (`superseded{stage="early"}`); the run is left alone.
-            try:
-                self.catalog.job(self.name, JobReport(status="superseded"))
-            except RunNotRunning:
-                pass
-            except Exception:
-                logger.warning("Could not report job %s of run %s superseded", self.name, self.run_id, exc_info=True)
-        return self._outcome(reason)
-
-    def _report_failure(self, error: Exception) -> None:
-        # Report it, or the run waits for this job forever.
-        report = JobReport(status="failed", error=f"{type(error).__name__}: {error}", provenance=self.provenance())
-        try:
-            self.catalog.job(self.name, report)
-        except RunNotRunning:
-            logger.warning("Run %s is not accepting results", self.run_id)
-        except Exception:
-            logger.exception("Could not report the failed %s job for run %s", self.name, self.run_id)
-
-    def _outcome(self, outcome: Outcome) -> Outcome:
-        metrics.record_job(self.kind, outcome)
-        return outcome
 
     # -- extraction -------------------------------------------------------------------------------
 
@@ -229,7 +99,10 @@ class EquationsJob:
 
         `Stop` from a re-read of the run ends it early; the crops in flight finish first.
         """
-        regions = self._regions.validate_python(self.raw_regions)
+        regions = self.message.regions
+        # Refuses an `output_dir` that escapes the storage root here, as a failed job, rather than
+        # crop by crop (each crop's error is only logged, and the job would report `done` with none).
+        self.settings.storage_file(self.message.output_dir)
         workers = self.settings.latex_workers
         kept: list[Region] = []
         pending: deque[tuple[LayoutRegion, str, Future]] = deque()
@@ -248,13 +121,13 @@ class EquationsJob:
             ThreadPoolExecutor(max_workers=workers, thread_name_prefix="latex") as pool,
         ):
             for region in regions:
-                self._recheck()
+                self.recheck()
                 unfinished.acquire()
                 try:
                     name, image = self.crop(document, region)
                 except Exception:
                     unfinished.release()
-                    logger.exception("Run %s: equation p%s/%s skipped", self.run_id, region.page, region.seq)
+                    logger.exception("Run %s: equation p%s/%s skipped", self.message.run_id, region.page, region.seq)
                     metrics.REGIONS.add(1, {"outcome": "failed"})
                     continue
                 if image is None:
@@ -299,10 +172,10 @@ class EquationsJob:
             "" if dpi == self.settings.crop_dpi else f" (lowered from {self.settings.crop_dpi}: MAX_CROP_PIXELS)",
         )
         image = crops.render(page, clip, dpi)
-        name = crops.crop_name(self.output_dir, region.page, region.seq)
+        name = crops.crop_name(self.message.output_dir, region.page, region.seq)
         if min(image.size) < self.settings.min_crop_pixels:
             return name, None
-        crops.save(image, self.settings.storage_path, name, self.settings.webp_quality)
+        crops.save(image, self.settings.storage_file(name), self.settings.webp_quality)
         return name, image
 
     def transcribe(self, image: Image.Image) -> tuple[str | None, dict[str, Any]]:
@@ -322,12 +195,13 @@ class EquationsJob:
             source_latex, provenance = future.result()
             normalized = latex.normalize(source_latex)
         except Exception:
-            logger.exception("Run %s: equation p%s/%s skipped", self.run_id, region.page, region.seq)
+            logger.exception("Run %s: equation p%s/%s skipped", self.message.run_id, region.page, region.seq)
             return None
         if normalized and normalized != source_latex:
             # The model's LaTeX is what is shown; sympy's form is kept for comparison and search.
             provenance["sympy"] = normalized
         return Region(
+            kind="equation",
             page=region.page,
             seq=region.seq,
             bbox=region.bbox,

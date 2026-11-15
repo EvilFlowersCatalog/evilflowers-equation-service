@@ -1,61 +1,28 @@
-"""Configuration of the worker: one typed object read from the environment (and `.env`).
+"""Configuration of the worker: the kit's ``WorkerSettings`` plus the crop and LaTeX fields.
 
-Every field keeps the environment variable name the deployments already set
-(``REDIS_URL``, ``EQUATION_QUEUE``, ``CATALOG_API_KEY``, ``LATEX_BACKEND`` …),
-so the move from the old module-level settings needs no change in the k8s manifests.
+The broker, shutdown, delivery cap, storage, image tag, logs and catalog ingestion API are
+``evilflowers_worker.settings.WorkerSettings`` (``REDIS_URL``, ``WORKER_SOFT_SHUTDOWN_TIMEOUT``,
+``WORKER_CANCEL_TIMEOUT``, ``MAX_DELIVERIES``, ``STORAGE_PATH``, ``CATALOG_API_KEY`` …). Every field
+keeps the environment variable name the deployments already set.
 """
 
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from evilflowers_worker.settings import WorkerSettings
 from pydantic import AliasChoices, Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", frozen=True)
-
-    # -- Celery -------------------------------------------------------------------
-    redis_url: str = "redis://redis:6379/7"
+class Settings(WorkerSettings):
     queue: str = Field("evilflowers_equation", validation_alias=AliasChoices("EQUATION_QUEUE", "QUEUE"))
-    #: Seconds before Redis redelivers an unacknowledged message. The job acknowledges
-    #: late, so this must outlast the longest book (LaTeX-OCR runs on CPU, region by region).
-    broker_visibility_timeout: int = 7200
-    #: Seconds a SIGTERMed worker (scale-in, rollout) lets the running book continue before it cancels it
-    #: and Redis gets the message back (#4). Without it the book returned only after the visibility timeout.
-    worker_soft_shutdown_timeout: float = Field(10.0, ge=0)
-    #: Also wait `worker_soft_shutdown_timeout` when no task is running (Celery's `..._on_idle`).
-    worker_enable_soft_shutdown_on_idle: bool = False
-    #: Deliveries of one task id that may start the book (#6). The next one reports the job `failed`
-    #: without decoding: a book that kills the worker (OOM) every time would otherwise loop forever.
-    #: A SIGTERM requeue is not counted. 0 turns the cap off.
+    #: Deliveries before the job is reported `failed` instead of decoded again (#6). Lower than the kit's 5:
+    #: each delivery of a book that kills the worker costs up to hours of CPU. 0 turns the cap off.
     max_deliveries: int = Field(3, ge=0)
-    #: Seconds the delivery count of a task id is kept in Redis; longer than the visibility timeout.
-    delivery_ttl: int = Field(172800, ge=1)
-
-    # -- Storage and provenance -----------------------------------------------------
-    #: The catalog's storage root: originals are read here, crops written.
-    storage_path: Path = Path("/mnt/data")
-    #: Built into the image by CI; recorded in every run's provenance and as `service.version`.
-    image_tag: str = "dev"
-
-    # -- Catalog ingestion API (IP-018) ---------------------------------------------
-    catalog_api_url: str = "http://catalog:8000"
-    #: API key (bearer JWT) of the catalog user holding `extraction.ingest_extraction`.
-    catalog_api_key: SecretStr | None = None
-    #: Rows per request; keeps each body well under Django's 2.5 MB upload limit.
-    catalog_batch_size: int = 100
-    catalog_attempts: int = 4
-    catalog_timeout: float = 120.0
     #: Seconds between reads of the run while a book is decoded (#5, catalog#140). The job stops when
     #: the run is no longer `running`, was started again (a new `attempt`) or no longer waits for it. 0 = only once,
     #: before the work.
     run_check_interval: float = Field(300.0, ge=0)
-
-    # -- Logs ---------------------------------------------------------------------------
-    #: `json` (one object per line, what Loki parses) or `text` (Celery's own format, for a terminal).
-    log_format: Literal["json", "text"] = "json"
 
     # -- Crops ----------------------------------------------------------------------------
     crop_dpi: int = 200
@@ -92,10 +59,6 @@ class Settings(BaseSettings):
     latex_model: str = "qwen2.5vl:7b"
     #: Seconds per Ollama request (one crop).
     latex_timeout: float = 120.0
-
-    def source_path(self, source: str) -> Path:
-        """Absolute path of a file the catalog names relative to its storage root."""
-        return self.storage_path / source
 
 
 @lru_cache

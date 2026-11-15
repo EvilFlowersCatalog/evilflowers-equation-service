@@ -46,6 +46,20 @@ jobs:
     concurrency:
       group: equation-test-${{ github.ref }}
       cancel-in-progress: true
+    # tests/test_worker.py runs the image's app as a real prefork worker (evilflowers_worker.testing.WorkerProcess)
+    # against this Redis; with `CI` set it fails instead of skipping when Redis does not answer.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -56,9 +70,6 @@ jobs:
       # no exporters, no Pyroscope.
       - name: Install
         run: uv sync --locked --extra onnx
-      # tests/test_worker.py starts a real Redis to prove the SIGTERM requeue and the delivery cap (#4, #6).
-      - name: Install redis-server
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server
       - name: Lint
         run: |
           uv run ruff check

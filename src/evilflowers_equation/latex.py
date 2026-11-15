@@ -21,10 +21,11 @@ from unittest.mock import patch
 
 import numpy as np
 import requests
+from evilflowers_worker.http import session
+from evilflowers_worker.observability import span
 from PIL import Image
 
-from evilflowers_equation.clients.http import session
-from evilflowers_equation.observability import metrics, span
+from evilflowers_equation import metrics
 from evilflowers_equation.settings import Settings
 
 logger = logging.getLogger(__name__)
