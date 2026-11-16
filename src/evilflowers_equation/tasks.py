@@ -1,4 +1,6 @@
-"""The IP-018 `equations` task, dispatched by evilflowers-analyzer-service with keyword arguments.
+"""The tasks: IP-018 `equations` (below) and the books digitalizer's `standalone.formulas` (``standalone``, #8).
+
+`equations` is dispatched by evilflowers-analyzer-service with keyword arguments.
 
 The message is a ``RegionsJob`` (``evilflowers_worker.contract``): ``run_id``, ``source``, ``output_dir``,
 ``regions``, and two optional fields (#5): ``job``, the batch's job name (`equations:0001-0008`) when the
@@ -23,7 +25,10 @@ from celery import shared_task
 from evilflowers_worker import runtime
 from evilflowers_worker.contract import RegionsJob
 
-from evilflowers_equation import worker  # noqa: F401 - create_app must run in a spawned pool child too
+from evilflowers_equation import (
+    standalone,
+    worker,  # noqa: F401 - create_app must run in a spawned pool child too
+)
 from evilflowers_equation.jobs import EquationsJob
 
 
@@ -31,3 +36,9 @@ from evilflowers_equation.jobs import EquationsJob
 def equations(self, **kwargs: Any) -> str:
     """Formula regions found by the analyzer's layout pass: WebP crop, LaTeX and sympy's form."""
     return runtime.run_job(self, EquationsJob, RegionsJob, kwargs)
+
+
+@shared_task(name="evilflowers_equation.standalone.formulas", bind=True, **runtime.JOB_TASK_OPTIONS)
+def formulas(self, **kwargs: Any) -> dict:
+    """The books digitalizer's formulas of leaf images (#8): `formulas.json` and an outcome file, no catalog call."""
+    return runtime.run_task(self, standalone.run, standalone.FormulasJob, kwargs, on_capped=standalone.give_up)

@@ -1,14 +1,17 @@
 # EvilFlowers Equation Service
 
-The Celery worker that reads the formulas of the catalog's PDFs. For
-[EvilFlowersCatalog](https://github.com/EvilFlowersCatalog/EvilFlowersCatalog) it runs the `equations` job of an
-IP-018 extraction run. It takes each formula region the analyzer's layout pass found and does three things:
+The Celery worker that reads formulas. It has two callers:
 
-- crops it to WebP;
-- transcribes it to LaTeX;
-- normalizes the LaTeX with sympy where it parses.
+- **The catalog.** For [EvilFlowersCatalog](https://github.com/EvilFlowersCatalog/EvilFlowersCatalog) it runs the
+  `equations` job of an IP-018 extraction run. It takes each formula region the analyzer's layout pass found in a PDF
+  and does three things:
+  - crops it to WebP;
+  - transcribes it to LaTeX;
+  - normalizes the LaTeX with sympy where it parses.
 
-The results go back to the catalog as regions of kind `equation`.
+  The results go back to the catalog as regions of kind `equation`.
+- **The books digitalizer.** It runs the catalog-free task `standalone.formulas` (#8): regions of leaf images in,
+  LaTeX or text in `formulas.json` out, transcribed by PaddleOCR-VL. See [Standalone formulas](#standalone-formulas).
 
 The worker runtime comes from [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker), pinned
 to a commit in `pyproject.toml` (`[tool.uv.sources]`). The kit provides the message contract, the catalog client,
@@ -22,6 +25,7 @@ The task name, queue and argument shape below are a contract with the caller (`t
 | Task | Queue | Sent by | Does |
 |---|---|---|---|
 | `evilflowers_equation.equations` | `evilflowers_equation` | analyzer, kwargs `run_id, source, output_dir, regions`, optional `job`, `attempt` | For each region `{page, seq, bbox}` (page fractions, top-left origin), on every page: renders a crop at `CROP_DPI` into `<STORAGE_PATH>/<output_dir>/p041-eq02.webp`, transcribes it to LaTeX, and adds sympy's form where it parses and differs. Posts the regions to `/regions`, then reports the job. |
+| `evilflowers_equation.standalone.formulas` | `evilflowers_equation.standalone` (bulk), `evilflowers_equation.standalone.interactive` | books digitalizer, the kit's `StandaloneJob` plus `regions` | See [Standalone formulas](#standalone-formulas). Writes `formulas.json` and the outcome file; no catalog call. |
 
 - **`job`** (#5): sent when the analyzer dispatches one task per layout batch (`DISPATCH_PER_BATCH`). The task
   reports under that name (`/jobs/equations:0001-0008`) instead of `equations`. An empty batch (`regions: []`)
@@ -82,14 +86,74 @@ run's regions and `/regions` does not upsert, so a requeued book could not skip 
 without storing it twice. Per-batch tasks (#5) are the chunks instead: a requeue repeats one batch of
 `LAYOUT_BATCH_PAGES` pages, not a whole book.
 
+## Standalone formulas
+
+`evilflowers_equation.standalone.formulas` (#8) serves the books digitalizer
+(evilflowers-books-digitalizer, `docs/design/target-architecture.md` §2–§3, §6). The digitalizer is the system of
+record: the task holds no catalog key and never calls the catalog. The diagram is
+[docs/diagrams/sequence-standalone-formulas.puml](docs/diagrams/sequence-standalone-formulas.puml).
+
+**Message.** The kit's `StandaloneJob` (`run_id`, `job`, `token`, `inputs`, `output_dir`, `outcome`) plus:
+
+```json
+{"regions": [{"key": "region-1734", "leaf": 3, "image": "digitized/…/0003.tif",
+              "bbox": [0.08, 0.41, 0.62, 0.47], "task": "formula"}]}
+```
+
+- `bbox`: fractions of the leaf image, origin top-left, `x0, y0, x1, y1`.
+- `task`: `formula` gives LaTeX. `ocr` gives text with inline math, for a table or a mixed line.
+- Keys must be unique; a message with duplicates fails validation and raises with no outcome file (the kit's
+  default). `image` must be one of `inputs`; otherwise the job writes a `failed` outcome.
+- `bbox` is not range-checked: a box that overshoots the leaf by a rounding error is clamped to it.
+
+**Work.** Each leaf is opened once. Each region is cropped with 10 px of context, the way the vlm service was
+validated, and bounded to about 1 MP at once (a job holds its crops until it writes the rows). It is then transcribed by PaddleOCR-VL through the shared vlm service (`VLM_*` below). A `formula` answer goes
+through `latex.clean`. An `ocr` answer is only stripped, because `clean` would eat its `$…$`.
+
+**Output.** `formulas.json` in `output_dir` holds one row per region, in message order:
+
+```json
+{"key": "region-1734", "text": "E = mc^2", "model": "paddleocr-vl:PaddleOCR-VL-1.6@132c45f"}
+```
+
+- `text: null` means "no answer": the model gave none, or the box was empty. The digitalizer keeps such a region as
+  an image crop.
+- A row may carry `"disputed": true` and a `"reason"` (quality checks below).
+
+The outcome file is written last and atomically: `{run_id, token, status, error, formulas}`, with `status` set to
+`done` or `failed`.
+- **Any error writes `failed` and raises,** so the orchestrator's `link_error` fires. That covers an unreadable leaf,
+  an image that is not an input, an `output_dir` that escapes `STORAGE_PATH`, and a vlm still unavailable after
+  `VLM_ATTEMPTS`.
+- **Past `MAX_DELIVERIES` it does the same** without working.
+- **The task returns `{"job", "answered"}`,** which is what the `link` callback receives.
+
+**Quality checks** (`checks.py`, design §6). A check marks an answer `disputed` and never edits it:
+
+- **Repetition** (always on): the answer ends in a loop (`latex.repeats`, span `LATEX_REPETITION_STOP`).
+- **Render** (`FORMULAS_MIN_SIMILARITY`, 0 = off): the LaTeX is rendered with matplotlib's mathtext (the `check`
+  extra) and compared with the crop by structural similarity. **The threshold is not calibrated,** so the check is
+  off until the digitalizer's review screen has measured it. LaTeX that mathtext cannot render stays unchecked.
+- **Cross-check** (`FORMULAS_CROSSCHECK=true`): LaTeX-OCR (`onnx`) reads the formula too. Readings whose sympy forms,
+  or canonical LaTeX where sympy cannot parse, agree less than `FORMULAS_CROSSCHECK_MIN_RATIO` (0.8) are disputed.
+  This doubles the CPU per crop.
+
+**Deployment.** The standalone task runs as a second Deployment of the same image:
+- `REDIS_URL` on db 8;
+- `--queues=evilflowers_equation.standalone` for bulk (KEDA, 0..N), or `….standalone.interactive` for the one
+  replica that is always on;
+- no `CATALOG_API_KEY`;
+- `STORAGE_PATH` on the digitalizer's library mount.
+
 ## LaTeX
 
-`LATEX_BACKEND` picks the recognizer:
+`LATEX_BACKEND` picks the recognizer of the catalog task:
 
 | Backend | What | `latex_model` in provenance |
 |---|---|---|
 | `onnx` (default) | LaTeX-OCR (pix2tex) on ONNX Runtime, CPU, through `rapid-latex-ocr`. The four weight files are downloaded into `MODELS_PATH` on first use and reused after that (in k8s, the `models` PVC). | `rapid-latex-ocr` |
 | `ollama` | A multimodal model behind an Ollama `/api/chat` endpoint (`OLLAMA_ENDPOINT`, `LATEX_MODEL`, `LATEX_TIMEOUT`). | `ollama:<model>` |
+| `paddleocr-vl` | PaddleOCR-VL behind the shared vlm service, `POST /v1/formulas` (`VLM_ENDPOINT`). It sends crops in batches of `VLM_BATCH_SIZE` (at most 32), with a timeout of `VLM_TIMEOUT` per crop. A `503` (model loading, queue full) or a lost connection is retried after the service's `Retry-After`, or with exponential backoff, capped at `VLM_MAX_WAIT`, up to `VLM_ATTEMPTS` tries. The service sends no model revision, so `VLM_MODEL_REVISION` names the one in the deployed image. The standalone task always uses this backend. | `paddleocr-vl:<VLM_MODEL_REVISION>` |
 | `none` | Crops and positions only. | `none` |
 
 Set `LATEX_THREADS` to the pod's CPU limit (`LATEX_THREADS=4`). rapid-latex-ocr does not set ONNX Runtime's
@@ -123,10 +187,12 @@ and only when it differs.
 ```
 src/evilflowers_equation/
 ├── worker.py          Celery app (`celery -A evilflowers_equation.worker worker`): the kit's `create_app("equation")`
-├── tasks.py           the `equations` task: `runtime.run_job(self, EquationsJob, RegionsJob, kwargs)`
+├── tasks.py           `equations` (`runtime.run_job`) and `standalone.formulas` (`runtime.run_task`)
 ├── jobs.py            `EquationsJob(LeafJob[RegionsJob, list[Region]])`: crops, the LaTeX pool, provenance
-├── latex.py           recognizers (onnx, ollama, none), cleanup of model output, sympy normalization
-├── crops.py           page geometry, rendering and WebP crops
+├── standalone.py      `FormulasJob(StandaloneJob)`: leaf crops, the vlm, `formulas.json`, the outcome file
+├── checks.py          quality checks of an answer: repetition, rendered-vs-crop similarity, onnx cross-check
+├── latex.py           recognizers (onnx, ollama, paddleocr-vl, none), cleanup of model output, sympy normalization
+├── crops.py           page geometry (PDF pages and leaf images), rendering and WebP crops
 ├── metrics.py         equation's own instruments (recognition, regions) on the kit's `Instrument`
 └── settings.py        `Settings(WorkerSettings)`: the queue, crop and LaTeX fields
 src/worker.py          deprecated shim for `celery --workdir src -A worker` (see Deployment)
@@ -134,9 +200,9 @@ src/worker.py          deprecated shim for `celery --workdir src -A worker` (see
 
 ## Development
 
-The project uses [uv](https://docs.astral.sh/uv/) and Python 3.12. It has three extras: `onnx` adds LaTeX-OCR,
-`otel` adds the OpenTelemetry SDK, and `profiling` adds the Pyroscope SDK (the last two are the kit's extras). The
-image installs all three. `tests/test_worker.py` runs the app as a real prefork worker against Redis at
+The project uses [uv](https://docs.astral.sh/uv/) and Python 3.12. It has four extras: `onnx` adds LaTeX-OCR,
+`check` adds matplotlib for the render check, `otel` adds the OpenTelemetry SDK, and `profiling` adds the Pyroscope
+SDK (the last two are the kit's extras). The image installs all four. `tests/test_worker.py` runs the app as a real prefork worker against Redis at
 `TEST_REDIS_URL` (default `redis://localhost:6379/15`) and is skipped without one, except in CI.
 
 To move to a newer kit, change `rev` in `[tool.uv.sources]` and run `uv lock --upgrade-package evilflowers-worker`.

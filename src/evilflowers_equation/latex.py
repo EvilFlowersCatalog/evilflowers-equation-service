@@ -224,7 +224,7 @@ class Decoded:
     stop: Stop
 
 
-def repeats(tokens: Sequence[int], span: int, max_period: int = 8) -> int:
+def repeats(tokens: Sequence[object], span: int, max_period: int = 8) -> int:
     """The period (1 to `max_period` tokens) with which the last `span` tokens repeat, or 0.
 
     A non-zero period is the decoder stuck in a loop (`\\qquad\\qquad…`, `e_{A},e_{A},…`).
@@ -326,6 +326,102 @@ class OllamaRecognizer:
         return clean(response.json().get("message", {}).get("content", ""))
 
 
+VlmTask = Literal["formula", "ocr"]
+
+
+@dataclass(frozen=True)
+class VlmItem:
+    """One crop for the vlm service: `formula` answers LaTeX, `ocr` text with inline math (a table, a mixed line)."""
+
+    key: str
+    image: Image.Image
+    task: VlmTask = "formula"
+
+
+class VlmUnavailable(RuntimeError):
+    """The vlm service did not answer a batch within `VLM_ATTEMPTS`."""
+
+
+class PaddleOcrVlRecognizer:
+    """`paddleocr-vl`: PaddleOCR-VL behind the shared vlm service (`POST /v1/formulas`, evilflowers-vlm-service).
+
+    Crops go in batches of `VLM_BATCH_SIZE`; the service runs one crop at a time, so a request's timeout grows with
+    its crops. A `503` (model still loading, queue full) or a lost connection is tried again after the service's
+    `Retry-After`, up to `VLM_ATTEMPTS`; then the batch raises `VlmUnavailable`. A crop the model could not read
+    comes back with an `error` and gives None.
+
+    `recognize` returns the model's raw text; `__call__` (the `Recognizer` of the catalog task) cleans it.
+    """
+
+    def __init__(self, settings: Settings, http: requests.Session | None = None, sleep=time.sleep):
+        self.endpoint = settings.vlm_endpoint
+        self.batch_size = settings.vlm_batch_size
+        self.timeout = settings.vlm_timeout
+        self.attempts = settings.vlm_attempts
+        self.max_wait = settings.vlm_max_wait
+        self.name = f"paddleocr-vl:{settings.vlm_model_revision}"
+        self.http = http or session()
+        self._sleep = sleep
+
+    def __call__(self, image: Image.Image) -> str | None:
+        return clean(self.recognize([VlmItem("crop", image)]).get("crop"))
+
+    def recognize(self, items: Sequence[VlmItem]) -> dict[str, str | None]:
+        """Each item's key → the model's text, or None where it gave no answer. Raises `VlmUnavailable`."""
+        answers: dict[str, str | None] = {}
+        for start in range(0, len(items), self.batch_size):
+            answers.update(self._batch(items[start : start + self.batch_size]))
+        return answers
+
+    def _batch(self, items: Sequence[VlmItem]) -> dict[str, str | None]:
+        body = {
+            "items": [
+                {"key": item.key, "image": base64.b64encode(png(item.image)).decode("ascii"), "task": item.task}
+                for item in items
+            ]
+        }
+        error = ""
+        for attempt in range(1, self.attempts + 1):
+            # Exponential backoff, unless the service says how long to wait.
+            wait = 2.0 ** (attempt - 1)
+            try:
+                response = self.http.post(self.endpoint, json=body, timeout=self.timeout * len(items))
+            except requests.ConnectionError as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            else:
+                if response.status_code != 503:
+                    response.raise_for_status()
+                    return self._answers(response.json())
+                error = f"503 {response.text[:200]}"
+                wait = _retry_after(response.headers.get("Retry-After"), default=wait)
+            if attempt < self.attempts:
+                wait = min(wait, self.max_wait)
+                logger.info(
+                    "vlm unavailable (%s), attempt %d of %d, again in %.0f s", error, attempt, self.attempts, wait
+                )
+                self._sleep(wait)
+        raise VlmUnavailable(f"vlm at {self.endpoint} unavailable after {self.attempts} attempts: {error}")
+
+    @staticmethod
+    def _answers(body: dict) -> dict[str, str | None]:
+        answers: dict[str, str | None] = {}
+        for result in body.get("results", []):
+            if result.get("error"):
+                logger.warning("vlm could not read %s: %s", result.get("key"), result["error"])
+                answers[result["key"]] = None
+            else:
+                answers[result["key"]] = result.get("text") or None
+        return answers
+
+
+def _retry_after(value: str | None, default: float) -> float:
+    """Seconds from a `Retry-After` header in seconds (the vlm sends no HTTP dates)."""
+    try:
+        return max(float(value), 0.0) if value is not None else default
+    except ValueError:
+        return default
+
+
 _recognizers: dict[tuple, Recognizer] = {}
 _recognizers_lock = threading.Lock()
 
@@ -341,6 +437,12 @@ def recognizer(settings: Settings) -> Recognizer:
         settings.latex_repetition_stop,
         settings.ollama_endpoint,
         settings.latex_model,
+        settings.vlm_endpoint,
+        settings.vlm_model_revision,
+        settings.vlm_batch_size,
+        settings.vlm_timeout,
+        settings.vlm_attempts,
+        settings.vlm_max_wait,
     )
     with _recognizers_lock:
         if key not in _recognizers:
@@ -349,6 +451,8 @@ def recognizer(settings: Settings) -> Recognizer:
                     _recognizers[key] = OnnxRecognizer(settings)
                 case "ollama":
                     _recognizers[key] = OllamaRecognizer(settings)
+                case "paddleocr-vl":
+                    _recognizers[key] = PaddleOcrVlRecognizer(settings)
                 case _:
                     _recognizers[key] = NoRecognizer()
         return _recognizers[key]

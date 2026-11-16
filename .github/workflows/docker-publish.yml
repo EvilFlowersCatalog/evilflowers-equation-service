@@ -69,7 +69,7 @@ jobs:
       # Core + dev group + rapid-latex-ocr (tests/test_latex.py guards how its ONNX sessions are built);
       # no exporters, no Pyroscope.
       - name: Install
-        run: uv sync --locked --extra onnx
+        run: uv sync --locked --extra onnx --extra check
       - name: Lint
         run: |
           uv run ruff check

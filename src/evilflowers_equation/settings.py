@@ -36,8 +36,9 @@ class Settings(WorkerSettings):
 
     # -- LaTeX recognition ------------------------------------------------------------------
     #: `onnx`: LaTeX-OCR (pix2tex) weights on ONNX Runtime, CPU, downloaded to `MODELS_PATH` on first use.
-    #: `ollama`: a multimodal model behind an Ollama endpoint. `none`: crops and positions only.
-    latex_backend: Literal["onnx", "ollama", "none"] = "onnx"
+    #: `ollama`: a multimodal model behind an Ollama endpoint. `paddleocr-vl`: the shared vlm service (`VLM_*`).
+    #: `none`: crops and positions only. The standalone task always uses `paddleocr-vl`.
+    latex_backend: Literal["onnx", "ollama", "paddleocr-vl", "none"] = "onnx"
     #: ONNX Runtime intra-op threads per session; match the pod's CPU limit. 0 = ORT default (all node cores).
     #: The decoder makes up to 512 tiny `run()` calls per crop, and more threads than the CPU quota
     #: mostly burn that quota on synchronisation (CFS throttling).
@@ -59,6 +60,34 @@ class Settings(WorkerSettings):
     latex_model: str = "qwen2.5vl:7b"
     #: Seconds per Ollama request (one crop).
     latex_timeout: float = 120.0
+
+    # -- PaddleOCR-VL (the shared vlm service, evilflowers-vlm-service) ------------------------
+    vlm_endpoint: str = "http://vlm.shared.svc.cluster.local/v1/formulas"
+    #: Recorded as `paddleocr-vl:<revision>` (`latex_model` and each `formulas.json` row). The service reports only
+    #: its model directory, so the revision baked into the deployed vlm image is set here.
+    vlm_model_revision: str = "PaddleOCR-VL-1.6@132c45f"
+    #: Crops per request (the service takes at most 32). It runs a request's crops one after another on CPU.
+    vlm_batch_size: int = Field(8, ge=1, le=32)
+    #: Seconds a request may take per crop it carries; the request's timeout is this times its crops.
+    vlm_timeout: float = Field(60.0, gt=0)
+    #: Requests per batch at most: a `503` (model loading, queue full) or a connection error is tried again.
+    vlm_attempts: int = Field(5, ge=1)
+    #: Seconds waited at most between two attempts, whatever the service's `Retry-After` says.
+    vlm_max_wait: float = Field(120.0, ge=0)
+
+    # -- Standalone task (evilflowers_equation.standalone.formulas, #8) ----------------------------
+    #: Bulk jobs (KEDA, 0..N) and the operator's interactive jobs (one replica, always on). The standalone Deployment
+    #: consumes them on its own Redis db (`REDIS_URL`, db 8) and needs no catalog key.
+    standalone_queue: str = "evilflowers_equation.standalone"
+    interactive_queue: str = "evilflowers_equation.standalone.interactive"
+    #: Quality check: the LaTeX is rendered (matplotlib mathtext, the `check` extra) and compared with the crop
+    #: (structural similarity). A formula that scores below this is marked `disputed`. Uncalibrated, so 0 = off.
+    formulas_min_similarity: float = Field(0.0, ge=0, le=1)
+    #: Quality check: LaTeX-OCR (`onnx`) reads each formula too, and a formula the two models read differently is
+    #: marked `disputed`. Doubles the CPU per crop; needs the `onnx` extra.
+    formulas_crosscheck: bool = False
+    #: How alike (difflib ratio of the normalised LaTeX) the two readings must be to agree.
+    formulas_crosscheck_min_ratio: float = Field(0.8, ge=0, le=1)
 
 
 @lru_cache

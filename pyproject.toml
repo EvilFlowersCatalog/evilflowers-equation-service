@@ -29,6 +29,9 @@ onnx = [
     # `OrtInferSession` of its `main` and `models` modules to set the thread count (LATEX_THREADS).
     "rapid-latex-ocr==0.0.9",
 ]
+# The standalone task's render check (FORMULAS_MIN_SIMILARITY): LaTeX drawn by matplotlib's mathtext. Imported
+# lazily; without it the check leaves formulas unchecked and its test is skipped (CI installs it).
+check = ["matplotlib>=3.9"]
 # OTLP/HTTP to the node's Alloy (the kit's pinned SDK, exporter and instrumentations).
 otel = ["evilflowers-worker[otel]"]
 # Pyroscope SDK: Python frames the node's eBPF profiler cannot unwind; on only with PYROSCOPE_SERVER_ADDRESS.
@@ -42,8 +45,8 @@ dev = [
 ]
 
 [tool.uv.sources]
-# master @ c37d860 ("Implementing #3"): `RuntimeSettings.storage_file`, `WorkerSettings(RuntimeSettings)`.
-evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "c37d860513662adcb85794adabea39af456ffee8" }
+# master @ e530f68 ("Fixing #8 and #9"): `contract.StandaloneJob`, `runtime.run_task`, `outcome.write_outcome` (#5).
+evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "e530f68d2e3d98519008d39b30fee96f28009834" }
 
 [build-system]
 requires = ["hatchling>=1.27"]

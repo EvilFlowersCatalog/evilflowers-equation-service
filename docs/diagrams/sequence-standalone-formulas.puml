@@ -1,0 +1,48 @@
+@startuml sequence-standalone-formulas
+!include elvira.iuml
+' =============================================================================
+' What: the standalone formulas task crops each region from its leaf image, has the shared vlm transcribe the crops
+'       in batches, optionally checks each answer, writes formulas.json and then the outcome file, and never calls the
+'       catalog.
+' Kind: UML sequence diagram. Scope: one bulk job (up to 32 leaves); the interactive queue runs the same path. Left
+'       out: the orchestrator's reconcile beat, and the catalog task `equations` (unchanged).
+' Source: evilflowers-equation-service#8 and its contract comment, evilflowers-worker@e530f68 (contract.StandaloneJob,
+'       runtime.run_task, outcome.write_outcome), evilflowers-vlm-service app.py, evilflowers-books-digitalizer
+'       docs/design/target-architecture.md §2, §6 (2026-11-16)
+' =============================================================================
+
+title Standalone formulas task (proposal, 2026-11-16)
+
+participant "digitalizer\norchestrator" as orch
+queue "Redis db 8\nevilflowers_equation.standalone" as redis
+participant "equation worker\nstandalone.formulas" as worker <<proposed>> <<focus>>
+participant "vlm (shared)\nPOST /v1/formulas" as vlm <<proposed>>
+database "STORAGE_PATH\n(NFS)" as storage
+queue "digitalizer.portal" as portal
+
+orch -> redis : send_task(standalone.formulas,\nStandaloneJob + regions, link, link_error)
+redis -> worker : deliver (prefetch 1, acks late)
+worker -> worker : run_task: validate; past MAX_DELIVERIES → failed outcome
+worker -> storage : open each leaf image once\ncrop bbox fractions + 10 px pad
+loop batches of VLM_BATCH_SIZE (≤ 32)
+  worker -[$accent_msg()]> vlm : <b>items[{key, image (base64 PNG), task}]</b>
+  alt 503 + Retry-After (loading or busy)
+    vlm --> worker : wait Retry-After, retry (VLM_ATTEMPTS)
+  else 200
+    vlm --> worker : {model, results[{key, text, error}]}
+  end
+end
+worker -> worker : repetition loop (always)\n→ disputed + reason
+opt FORMULAS_MIN_SIMILARITY > 0 / FORMULAS_CROSSCHECK
+  worker -> worker : render LaTeX (mathtext) vs crop (SSIM);\nonnx vs vlm disagreement\n→ disputed + reason
+end
+worker -> storage : formulas.json (atomic)\nthen outcome {status: done, formulas}
+worker -> portal : link: job_done({job, answered}, job_id)
+note over worker, portal
+  Any exception: outcome {status: failed, error}, then raise → link_error: job_failed(task_id, job_id).
+  SIGTERM requeue writes nothing; the redelivery writes the outcome.
+end note
+
+caption The worker holds no catalog credential: the orchestrator learns of the end from the link callback, reads the outcome, checks the token and promotes formulas.json.
+footer ELVIRA · FIIT STU · evilflowers-equation-service · docs/diagrams/sequence-standalone-formulas.puml
+@enduml

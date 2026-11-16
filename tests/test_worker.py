@@ -4,17 +4,26 @@ The real-worker test needs ``TEST_REDIS_URL`` (default ``redis://localhost:6379/
 when no Redis answers, except in CI (``CI`` set), where a missing Redis is a failure.
 """
 
+import json
 import os
+import threading
+import uuid
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from evilflowers_worker.testing import StubCatalogServer, WorkerProcess, redis_client, wait_for
+from evilflowers_worker.testing import StubCatalogServer, WorkerProcess, assert_outcome, redis_client, wait_for
+from PIL import Image
 
 from conftest import region, write_pdf
 from evilflowers_equation import tasks
 from evilflowers_equation.worker import app
 
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
-TASKS = {"evilflowers_equation.equations": "evilflowers_equation"}
+TASKS = {
+    "evilflowers_equation.equations": "evilflowers_equation",
+    "evilflowers_equation.standalone.formulas": "evilflowers_equation.standalone",
+}
 
 
 def test_every_task_is_registered_and_routed():
@@ -24,10 +33,21 @@ def test_every_task_is_registered_and_routed():
         assert app.amqp.router.route({}, name)["queue"].name == queue
 
 
-def test_the_task_acknowledges_late_and_requeues_a_lost_worker():
-    task = app.tasks["evilflowers_equation.equations"]
-    assert task.acks_late and task.reject_on_worker_lost
+def test_the_tasks_acknowledge_late_and_requeue_a_lost_worker():
+    for name in TASKS:
+        task = app.tasks[name]
+        assert task.acks_late and task.reject_on_worker_lost, name
     assert tasks.equations.name == "evilflowers_equation.equations"
+    assert tasks.formulas.name == "evilflowers_equation.standalone.formulas"
+
+
+def test_every_queue_is_declared():
+    declared = {queue.name for queue in app.conf.task_queues}
+    assert declared == {
+        "evilflowers_equation",
+        "evilflowers_equation.standalone",
+        "evilflowers_equation.standalone.interactive",
+    }
 
 
 def test_the_kit_runs_the_delivery_semantics():
@@ -81,3 +101,75 @@ def test_a_book_runs_end_to_end_in_a_real_worker(broker, tmp_path):
     ]
     assert (storage / "out/v1/p002-eq01.webp").exists()
     assert catalog.calls[2][2]["status"] == "done"
+
+
+@contextmanager
+def stub_vlm():
+    """The vlm service's `POST /v1/formulas`, answering `x^{2}` for every crop."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            results = [{"key": item["key"], "text": "$x^{2}$", "secs": 0.0} for item in body["items"]]
+            payload = json.dumps({"model": "stub", "results": results}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1/formulas"
+    finally:
+        server.shutdown()
+
+
+def test_a_standalone_job_runs_end_to_end_in_a_real_worker(broker, tmp_path):
+    """Sent as the digitalizer sends it (with a `link`), run without a catalog: rows, outcome, then the callback."""
+    storage = tmp_path / "data"
+    (storage / "leaves").mkdir(parents=True)
+    Image.new("RGB", (600, 800), "white").save(storage / "leaves/0001.png")
+    callbacks = f"test-callbacks-{uuid.uuid4().hex[:8]}"
+    with stub_vlm() as vlm:
+        env = {"STORAGE_PATH": str(storage), "VLM_ENDPOINT": vlm, "CATALOG_API_URL": "http://127.0.0.1:9"}
+        with WorkerProcess("evilflowers_equation.worker", redis_url=broker, env=env) as worker:
+            worker.wait_ready()
+            link = worker.producer().signature("digitalizer.job_done", kwargs={"job_id": "j-1"}, queue=callbacks)
+            worker.send_task(
+                "evilflowers_equation.standalone.formulas",
+                {
+                    "run_id": "run-1",
+                    "job": "formulas-0001-a1",
+                    "token": "tok",
+                    "inputs": ["leaves/0001.png"],
+                    "output_dir": "item/_studio/jobs/formulas-0001-a1",
+                    "outcome": "item/_studio/jobs/formulas-0001-a1/outcome.json",
+                    "regions": [
+                        {"key": "region-1", "leaf": 1, "image": "leaves/0001.png", "bbox": [0.1, 0.1, 0.5, 0.2]}
+                    ],
+                },
+                link=link,
+            )
+            try:
+                assert wait_for(lambda: worker.queued(callbacks), 60), worker.output
+                (callback,) = worker.queued(callbacks)
+            finally:
+                worker.redis.delete(callbacks)
+
+    assert WorkerProcess.args(callback) == [{"job": "formulas-0001-a1", "answered": 1}]
+    assert WorkerProcess.kwargs(callback) == {"job_id": "j-1"}
+    assert_outcome(
+        storage,
+        "item/_studio/jobs/formulas-0001-a1/outcome.json",
+        token="tok",
+        status="done",
+        after="item/_studio/jobs/formulas-0001-a1/formulas.json",
+    )
+    rows = json.loads((storage / "item/_studio/jobs/formulas-0001-a1/formulas.json").read_text())
+    assert rows == [{"key": "region-1", "text": "x^{2}", "model": "paddleocr-vl:PaddleOCR-VL-1.6@132c45f"}]
