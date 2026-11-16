@@ -10,11 +10,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from evilflowers_worker.judges import JudgeSettings
 from evilflowers_worker.settings import WorkerSettings
 from pydantic import AliasChoices, Field, SecretStr
 
 
-class Settings(WorkerSettings):
+class Settings(WorkerSettings, JudgeSettings):
+    """The judges' fields (``DECIDER_ENABLED``, ``DECIDER_VISION_URL``, ``DECIDER_VISION_REVISION``, ``JUDGE_*``) are
+    the kit's ``JudgeSettings``; off by default (#9)."""
+
     queue: str = Field("evilflowers_equation", validation_alias=AliasChoices("EQUATION_QUEUE", "QUEUE"))
     #: Deliveries before the job is reported `failed` instead of decoded again (#6). Lower than the kit's 5:
     #: each delivery of a book that kills the worker costs up to hours of CPU. 0 turns the cap off.
@@ -60,6 +64,10 @@ class Settings(WorkerSettings):
     latex_model: str = "qwen2.5vl:7b"
     #: Seconds per Ollama request (one crop).
     latex_timeout: float = 120.0
+
+    # -- Formula kind (#9): decider-vision on doubtful formulas only (`decisions`) --------------
+    #: Longest side of the crop sent to decider-vision, in pixels (the service scales to 448 itself).
+    judge_max_side: int = Field(448, ge=32)
 
     # -- PaddleOCR-VL (the shared vlm service, evilflowers-vlm-service) ------------------------
     vlm_endpoint: str = "http://vlm.shared.svc.cluster.local/v1/formulas"

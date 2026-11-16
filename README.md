@@ -182,6 +182,26 @@ length. Each crop logs `LaTeX-OCR: N tokens in S s`. There is no span per crop (
 The model's LaTeX is what readers see (`latex`). sympy's canonical form goes into the region's `provenance.sympy`,
 and only when it differs.
 
+## Formula kind (#9)
+
+Layout marks text lines, list markers, chemical labels and noise as formulas. The catalog task asks decider-vision
+whether such a crop is a formula, but only for doubtful ones (`decisions.py`):
+
+1. **Doubt, no model.** A kept formula is *doubtful* when sympy cannot parse its LaTeX, or it is shorter than 3
+   tokens. A second backend's disagreeing reading would count too, but the catalog task runs one backend, so this
+   check never fires there. A crop with no LaTeX is `unread` and is not judged.
+2. **Judge, doubtful only.** One `formula_kind` question goes to decider-vision through the kit's `judges`.
+   Categories: `formula`, `text`, `figure`, `table`, `noise`. The crop is sent as PNG, longest side
+   `JUDGE_MAX_SIDE` (448). The answer goes on the region as `decision`, `p` and `decider_model`
+   (EvilFlowersCatalog#189). The crop's doubts go into `signals.doubts`. `band` is posted only once
+   `JUDGE_THRESHOLDS` has `formula_kind` (knowledge#65); then `text` and `noise` are the hiding answers.
+3. **Never fatal.** With judges off, decider-vision down, the budget spent or any error, the region is posted as
+   before.
+
+Off by default. `DECIDER_ENABLED=true` and `DECIDER_VISION_URL` switch it on. `DECIDER_VISION_REVISION` and
+`JUDGE_BUDGET_*` come from the kit. decider-vision is scarce (~17 s a call, one replica). Read
+`equation_formulas_total{outcome}` first to learn the doubtful share, then enable it (knowledge#77).
+
 ## Layout
 
 ```
@@ -191,10 +211,11 @@ src/evilflowers_equation/
 ├── jobs.py            `EquationsJob(LeafJob[RegionsJob, list[Region]])`: crops, the LaTeX pool, provenance
 ├── standalone.py      `FormulasJob(StandaloneJob)`: leaf crops, the vlm, `formulas.json`, the outcome file
 ├── checks.py          quality checks of an answer: repetition, rendered-vs-crop similarity, onnx cross-check
+├── decisions.py       doubtful formulas (sympy, tokens, readings) and decider-vision's `formula_kind` (#9)
 ├── latex.py           recognizers (onnx, ollama, paddleocr-vl, none), cleanup of model output, sympy normalization
 ├── crops.py           page geometry (PDF pages and leaf images), rendering and WebP crops
 ├── metrics.py         equation's own instruments (recognition, regions) on the kit's `Instrument`
-└── settings.py        `Settings(WorkerSettings)`: the queue, crop and LaTeX fields
+└── settings.py        `Settings(WorkerSettings, JudgeSettings)`: the queue, crop, LaTeX and judge fields
 src/worker.py          deprecated shim for `celery --workdir src -A worker` (see Deployment)
 ```
 
@@ -266,6 +287,8 @@ kit's `evilflowers_worker.observability`. All of it is off when its variables ar
   - `equation_recognition_duration_seconds{model,outcome}`
   - `equation_regions_total{outcome}` (`kept`, `skipped`, `failed`)
   - `equation_document_regions`
+  - `equation_formulas_total{outcome}` (`doubtful`, `clean`, `unread`; counted with judges on or off)
+  - `equation_judge_total{question="formula_kind",outcome,band}` and `equation_judge_seconds` (the kit's judges)
   - `equation_catalog_retries_total`
   - `equation_deliveries_capped_total`
   - process CPU and memory

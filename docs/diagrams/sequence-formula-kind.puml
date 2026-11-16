@@ -1,0 +1,44 @@
+@startuml sequence-formula-kind
+!include elvira.iuml
+' =============================================================================
+' What: the catalog task `equations` asks decider-vision whether a crop is a formula only when its LaTeX is doubtful
+'       (sympy cannot parse it, or under 3 tokens), and posts the answer as decision / p / decider_model; with no
+'       answer the region is posted as before.
+' Kind: UML sequence diagram. Scope: one kept region inside EquationsJob._finish (the task thread). Left out: crops,
+'       the LaTeX pool, run re-reads and the standalone task (unchanged).
+' Source: evilflowers-equation-service#9, knowledge#76, knowledge#77, evilflowers-worker@e530f68 (judges.Panel,
+'       contract.Region decision fields, EvilFlowersCatalog#189) (2026-11-16)
+' =============================================================================
+
+title Formula kind of doubtful formulas (2026-11-16)
+
+participant "equation worker\nEquationsJob._finish" as worker <<focus>>
+participant "decisions.doubts\n(no model)" as doubts <<proposed>>
+database "STORAGE_PATH\n(NFS)" as storage
+participant "kit Panel\n(job budget, breaker)" as panel
+participant "decider-vision (shared)\nPOST /v1/systemone" as vision
+participant "catalog\nPOST regions" as catalog
+
+worker -> doubts : LaTeX, sympy form
+doubts --> worker : reasons (doubtful), [] (clean) or None (no LaTeX)
+worker -> worker : equation_formulas_total{outcome}
+alt doubtful
+  opt DECIDER_ENABLED + DECIDER_VISION_URL
+    worker -> storage : read the saved WebP crop
+    worker -> worker : PNG, longest side JUDGE_MAX_SIDE (448)
+  end
+  worker -[$accent_msg()]> panel : <b>ask(formula_kind, crop)</b>
+  alt budget left, breaker closed
+    panel -> vision : choice: formula | text | figure | table | noise
+    vision --> panel : verdict, p, model
+    panel --> worker : Verdict (band only with JUDGE_THRESHOLDS)
+    worker -> worker : decision, p, decider_model,\nsignals.doubts, provenance.formula_kind
+  else disabled, budget spent, open, unreachable, error
+    panel --> worker : None: region as before
+  end
+end
+worker -> catalog : regions (after all crops)
+
+caption The judge never fails the job; equation_judge_total{question="formula_kind",outcome,band} comes from the kit.
+footer ELVIRA · FIIT STU · evilflowers-equation-service · docs/diagrams/sequence-formula-kind.puml
+@enduml

@@ -8,6 +8,10 @@ The analyzer sends either one task per book, reported as `equations`, or one per
 `job` kwarg (`equations:0001-0008`, #5), reported under that name. Metrics keep the kind, `equations`,
 so their labels do not grow with page count.
 
+A formula whose LaTeX looks doubtful (``decisions``, #9) is shown to decider-vision, and its answer goes on the
+region as ``decision`` / ``p`` / ``decider_model``. The judge never fails the job: without an answer the region is
+posted as before.
+
 A single region that fails is logged and skipped; the job still reports `done` with the others. The
 run is read again every `RUN_CHECK_INTERVAL` while the crops are decoded (``recheck``), and the job
 stops there when the run moves on.
@@ -25,10 +29,11 @@ import pymupdf
 from evilflowers_worker.catalog import CatalogClient
 from evilflowers_worker.contract import LayoutRegion, Region, RegionsJob
 from evilflowers_worker.jobs import LeafJob
+from evilflowers_worker.judges import Judges
 from evilflowers_worker.observability import span
 from PIL import Image
 
-from evilflowers_equation import crops, latex, metrics
+from evilflowers_equation import crops, decisions, latex, metrics
 from evilflowers_equation.latex import Recognizer
 from evilflowers_equation.settings import Settings
 
@@ -48,6 +53,7 @@ class EquationsJob(LeafJob[RegionsJob, list[Region]]):
         task_id: str | None = None,
         delivery: int = 1,
         recognizer: Recognizer | None = None,
+        judges: Judges | None = None,
     ):
         interval = settings.run_check_interval
         super().__init__(
@@ -62,6 +68,9 @@ class EquationsJob(LeafJob[RegionsJob, list[Region]]):
         self.settings: Settings = settings
         self.path = settings.source_path(message.source)
         self.recognizer = recognizer or latex.recognizer(settings)
+        self.judges = judges or decisions.judges_for(settings)
+        # One per job: it holds the job's judge budget. Used on the task thread only (it is not thread-safe).
+        self.panel = self.judges.panel()
 
     # -- protocol ---------------------------------------------------------------------------------
 
@@ -200,7 +209,7 @@ class EquationsJob(LeafJob[RegionsJob, list[Region]]):
         if normalized and normalized != source_latex:
             # The model's LaTeX is what is shown; sympy's form is kept for comparison and search.
             provenance["sympy"] = normalized
-        return Region(
+        result = Region(
             kind="equation",
             page=region.page,
             seq=region.seq,
@@ -208,4 +217,38 @@ class EquationsJob(LeafJob[RegionsJob, list[Region]]):
             image_path=name,
             latex=source_latex,
             provenance=provenance,
+        )
+        try:
+            return self.decide(result, normalized)
+        except Exception:
+            # The judge never fails the job, nor drops the region: it goes out undecided.
+            logger.exception("Run %s: formula kind of p%s/%s undecided", self.message.run_id, region.page, region.seq)
+            return result
+
+    def decide(self, region: Region, normalized: str | None) -> Region:
+        """The region with decider-vision's ``formula_kind`` when its LaTeX is doubtful; unchanged otherwise.
+
+        Reads the saved crop back only for a doubtful formula with decider-vision configured, so the crops in flight
+        stay the only ones in memory.
+        """
+        reasons = decisions.doubts(region.latex, normalized)
+        metrics.FORMULAS.add(1, {"outcome": "unread" if reasons is None else "doubtful" if reasons else "clean"})
+        if not reasons:
+            return region
+        judge = self.judges.decider_vision
+        images: list[bytes] = []
+        if judge is not None:
+            assert region.image_path is not None
+            with Image.open(self.settings.storage_file(region.image_path)) as stored:
+                images.append(decisions.png(stored.convert("RGB"), self.settings.judge_max_side))
+        # No judge: the panel counts the question as `disabled` and answers None.
+        verdict = self.panel.ask(judge, decisions.FORMULA_KIND, state=decisions.STATE, images=images)
+        if verdict is None:
+            return region
+        return region.model_copy(
+            update={
+                **verdict.region_fields(),
+                "signals": {"doubts": reasons},
+                "provenance": {**region.provenance, **verdict.provenance()},
+            }
         )

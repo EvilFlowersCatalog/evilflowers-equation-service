@@ -20,6 +20,11 @@ RECOGNITION_DURATION = Instrument(
 REGIONS = Instrument(
     "counter", "{service}.regions", "{region}", "Equation regions, by what became of them (kept, skipped, failed)"
 )
+#: ``equation_formulas_total{outcome}``: doubtful, clean or unread (no LaTeX), judges on or off (#9). Its judge calls
+#: are the kit's ``equation_judge_total{question="formula_kind", outcome, band}``.
+FORMULAS = Instrument(
+    "counter", "{service}.formulas", "{formula}", "Kept equation regions, by the cheap doubt check (doubtful, clean)"
+)
 DOCUMENT_REGIONS = Instrument(
     "histogram", "{service}.document.regions", "{region}", "Equation regions kept per document", COUNT_BUCKETS
 )
