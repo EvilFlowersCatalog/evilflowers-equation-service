@@ -45,9 +45,11 @@ dev = [
 ]
 
 [tool.uv.sources]
-# Referenced by its master branch, not a commit. CI re-locks it to master's current commit on every build
-# (.github/workflows/test.yml), so the committed uv.lock entry only serves local development; the image records
-# the commit it got (IMAGE_TAG, OCI label). worker-nightly.yml rebuilds and redeploys develop when master moves.
+# Referenced by its master branch, not a commit. CI locks it per build, never committed (evilflowers-actions
+# resolve-worker, evilflowers-worker#13): develop and PRs follow master's head, main and tags the kit's newest release
+# tag (v0.1.0 = eb1d19c on 2026-11-22), rewriting this line to `tag = "…"` for that build only. The committed uv.lock
+# entry only serves local development; the image records the commit it got (IMAGE_TAG, OCI labels).
+# worker-nightly.yml rebuilds and redeploys develop when master moves.
 # Needs `contract.StandaloneJob`, `runtime.run_task`, `outcome.write_outcome` (#5), so master @ e530f68 or later.
 evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", branch = "master" }
 

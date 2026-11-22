@@ -25,7 +25,7 @@ The task name, queue and argument shape below are a contract with the caller (`t
 
 | Task | Queue | Sent by | Does |
 |---|---|---|---|
-| `evilflowers_equation.equations` | `evilflowers_equation` | analyzer, kwargs `run_id, source, output_dir, regions`, optional `job`, `attempt` | For each region `{page, seq, bbox}` (page fractions, top-left origin), on every page: renders a crop at `CROP_DPI` into `<STORAGE_PATH>/<output_dir>/p041-eq02.webp`, transcribes it to LaTeX, and adds sympy's form where it parses and differs. Posts the regions to `/regions`, then reports the job. |
+| `evilflowers_equation.equations` | `evilflowers.equation` | analyzer, kwargs `run_id, source, output_dir, regions`, optional `job`, `attempt` | For each region `{page, seq, bbox}` (page fractions, top-left origin), on every page: renders a crop at `CROP_DPI` into `<STORAGE_PATH>/<output_dir>/p041-eq02.webp`, transcribes it to LaTeX, and adds sympy's form where it parses and differs. Posts the regions to `/regions`, then reports the job. |
 | `evilflowers_equation.standalone.formulas` | `evilflowers_equation.standalone` (bulk), `evilflowers_equation.standalone.interactive` | books digitalizer, the kit's `StandaloneJob` plus `regions` | See [Standalone formulas](#standalone-formulas). Writes `formulas.json` and the outcome file; no catalog call. |
 
 - **`job`** (#5): sent when the analyzer dispatches one task per layout batch (`DISPATCH_PER_BATCH`). The task
@@ -245,7 +245,7 @@ Bump dependencies with `uv lock --upgrade-package <name>`.
 All settings are environment variables. `.env.sample` lists them, and `src/evilflowers_equation/settings.py` has
 their defaults and meaning. A deployment sets these:
 
-- `REDIS_URL` (default db 7) and `EQUATION_QUEUE` (default `evilflowers_equation`)
+- `REDIS_URL` (default db 7) and `EQUATION_QUEUE` (default `evilflowers.equation`)
 - `STORAGE_PATH`, the catalog's storage root, mounted read/write
 - `CATALOG_API_URL` and `CATALOG_API_KEY`
 - `LATEX_BACKEND` and `MODELS_PATH` (a writable volume), with either `LATEX_THREADS` (the CPU limit) or
@@ -256,16 +256,20 @@ their defaults and meaning. A deployment sets these:
 
 CI (`.github/workflows/docker-publish.yml`) works like text-service's:
 
-- every run re-locks evilflowers-worker to the ref its branch follows (`scripts/resolve-worker.sh`, the contract of
-  [evilflowers-worker#13](https://github.com/EvilFlowersCatalog/evilflowers-worker/issues/13)), then runs ruff and
-  pytest. `develop` and PRs follow the kit's `master`. `main` and tags follow its newest release tag `v*.*.*`, and
-  fall back to `master` with a warning if the kit has none. The repository variable `KIT_REF` holds every build on
-  one ref and pauses the nightly. The image is built from that tested lock, never from the committed one;
+- every run re-locks evilflowers-worker to the ref its branch follows, then runs ruff and pytest. The rule is the
+  shared `resolve-worker` action of
+  [evilflowers-actions](https://github.com/EvilFlowersCatalog/evilflowers-actions), the contract of
+  [evilflowers-worker#13](https://github.com/EvilFlowersCatalog/evilflowers-worker/issues/13). This repo calls it at
+  `@master`, because evilflowers-actions has no release tag yet. `develop` and PRs follow the kit's `master`. `main`
+  and tags follow its newest release tag `v*.*.*`, and the build fails if the kit has none. The repository variable
+  `KIT_REF` holds every build on one ref and pauses the nightly. The image is built from that tested lock, never
+  from the committed one. Cut a kit tag before you merge `develop` → `main`, or `main` builds on an older kit than
+  the one `develop` was tested against;
 - the image is pushed to `ghcr.io/evilflowerscatalog/evilflowers-equation-service` as `:main`, `:develop`, semver
   and `:sha-<short>`;
 - a push to `develop` also restarts the dev Deployment `equation` in `evilflowers-dev`, from the in-cluster runner
   `elvira-k3s`, and checks that the running pod uses the digest it just pushed;
-- every deploy, successful or failed, is reported to LGTM by `scripts/otlp-deploy.sh`. It sends a Loki event
+- every deploy, successful or failed, is reported to LGTM by the shared `scripts/otlp-deploy.sh` of evilflowers-actions (`@master`). It sends a Loki event
   `{service_name="github-actions"} | event_name="deployment"` and a Tempo span `deploy`, with
   `evilflowers.deploy.trigger` (`push`, `nightly` or `manual`), `evilflowers.worker.revision` and
   `evilflowers.worker.ref`;
@@ -274,23 +278,25 @@ CI (`.github/workflows/docker-publish.yml`) works like text-service's:
   the OCI labels `sk.stuba.elvira.evilflowers-worker.revision` and `sk.stuba.elvira.evilflowers-worker.ref`.
 
 The nightly job (`.github/workflows/worker-nightly.yml`, 02:17 UTC or by hand) keeps the dev deploy on the kit's
-latest `master`. It commits nothing. It compares `master`'s commit with the OCI label of the `:develop` image:
+latest `master`. It calls the shared `worker-nightly.yml` of evilflowers-actions (`@master`) and commits nothing. It
+compares `master`'s commit with the OCI label of the `:develop` image:
 
-- equal: it does nothing. There is no image and no restart.
+- equal, or `KIT_REF` set (a hold): it does nothing. There is no image and no restart.
 - different: it dispatches this workflow on `develop` with `reason=nightly`, which re-locks, tests, builds,
-  deploys and reports to LGTM. If that run fails, it opens the issue *Nightly: develop fails on the latest
-  evilflowers-worker*, or comments on it if it is already open. `:develop` keeps the last worker that passed, and
-  the next night tries again.
+  deploys and reports to LGTM. If that run fails, its `report-nightly-failure` job opens the issue *nightly:
+  evilflowers-worker &lt;sha&gt; breaks evilflowers-equation-service*, or comments on it if it is already open.
+  `:develop` keeps the last worker that passed, and the next night tries again.
 
 To rebuild and redeploy without a worker change, run the nightly by hand with `force`.
 
 The image starts the worker as `celery -A evilflowers_equation.worker worker --concurrency=1 -E
---queues=evilflowers.equation,evilflowers_equation`. That is prefork with one child: the model loads once in the
-child, and Flower can inspect the worker during a task. `evilflowers.equation` is the queue name in the
-`evilflowers.<service>` scheme
+--queues=evilflowers.equation`. That is prefork with one child: the model loads once in the child, and Flower can
+inspect the worker during a task. `evilflowers.equation` is the queue name in the `evilflowers.<service>` scheme
 ([EvilFlowersCatalog/knowledge#14](https://github.com/EvilFlowersCatalog/knowledge/issues/14)), and the analyzer
-sends there now. The legacy `evilflowers_equation` stays consumed until it is empty. After that the image consumes
-`evilflowers.equation` only (#10).
+sends there. The legacy `evilflowers_equation` is no longer consumed or declared (#10, #12). It had stayed empty
+on db 7 since the analyzer switched. **Release order:** the analyzer's fan-out to `evilflowers.equation`
+(analyzer#10) must reach `main` before or together with this change. Otherwise prod's analyzer keeps sending to
+`evilflowers_equation`, and nothing consumes it.
 
 For now the dev Deployment's `args` still copy the old command, `celery --workdir src -A worker`. `src/worker.py`
 keeps that command working. Remove it once the knowledge repo switches the role. That issue also covers the

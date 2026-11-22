@@ -21,7 +21,7 @@ from evilflowers_equation.worker import app
 
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 TASKS = {
-    "evilflowers_equation.equations": "evilflowers_equation",
+    "evilflowers_equation.equations": "evilflowers.equation",
     "evilflowers_equation.standalone.formulas": "evilflowers_equation.standalone",
 }
 
@@ -44,7 +44,7 @@ def test_the_tasks_acknowledge_late_and_requeue_a_lost_worker():
 def test_every_queue_is_declared():
     declared = {queue.name for queue in app.conf.task_queues}
     assert declared == {
-        "evilflowers_equation",
+        "evilflowers.equation",
         "evilflowers_equation.standalone",
         "evilflowers_equation.standalone.interactive",
     }

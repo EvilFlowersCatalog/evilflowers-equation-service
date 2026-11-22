@@ -19,7 +19,8 @@ class Settings(WorkerSettings, JudgeSettings):
     """The judges' fields (``DECIDER_ENABLED``, ``DECIDER_VISION_URL``, ``DECIDER_VISION_REVISION``, ``JUDGE_*``) are
     the kit's ``JudgeSettings``; off by default (#9)."""
 
-    queue: str = Field("evilflowers_equation", validation_alias=AliasChoices("EQUATION_QUEUE", "QUEUE"))
+    #: The catalog queue, `evilflowers.<service>` (knowledge#14); the legacy `evilflowers_equation` is gone (#10, #12).
+    queue: str = Field("evilflowers.equation", validation_alias=AliasChoices("EQUATION_QUEUE", "QUEUE"))
     #: Deliveries before the job is reported `failed` instead of decoded again (#6). Lower than the kit's 5:
     #: each delivery of a book that kills the worker costs up to hours of CPU. 0 turns the cap off.
     max_deliveries: int = Field(3, ge=0)

@@ -5,13 +5,15 @@ The task names and queues are a contract with their callers and must not change:
 ============================================  ===================================================  ===================
 Task                                          Queue                                                Sent by
 ============================================  ===================================================  ===================
-``evilflowers_equation.equations``            ``EQUATION_QUEUE`` (``evilflowers_equation``)        analyzer (kwargs)
+``evilflowers_equation.equations``            ``EQUATION_QUEUE`` (``evilflowers.equation``)        analyzer (kwargs)
 ``evilflowers_equation.standalone.formulas``  ``evilflowers_equation.standalone`` (bulk),          books digitalizer
                                               ``evilflowers_equation.standalone.interactive``
 ============================================  ===================================================  ===================
 
 All three queues are declared; a Deployment picks what it consumes with ``--queues``. The catalog one consumes
-``evilflowers_equation`` on db 7, the standalone ones the other two on db 8 (``REDIS_URL``).
+``evilflowers.equation`` on db 7, the standalone ones the other two on db 8 (``REDIS_URL``). The task names keep
+their ``evilflowers_equation.`` prefix; only the catalog queue moved to the ``evilflowers.<service>`` scheme
+(knowledge#14, #10, #12).
 
 Everything else is the kit's (``evilflowers_worker.runtime.create_app``): late acknowledgement, prefetch 1,
 the db-wide visibility timeout, the scale-in protocol of ``evilflowers_worker.shutdown`` (SIGTERM stays a

@@ -301,7 +301,7 @@ dev = [
 [[package]]
 name = "evilflowers-worker"
 version = "0.1.0"
-source = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?branch=master#1887447b9c7af6593101f41bdf628fc688a55fdd" }
+source = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?branch=master#eb1d19cef63c9e1570a9fd52bf37632249c7c161" }
 dependencies = [
     { name = "celery", extra = ["redis"] },
     { name = "opentelemetry-api" },

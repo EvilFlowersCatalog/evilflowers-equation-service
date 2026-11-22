@@ -8,16 +8,17 @@
 #   nightly          → worker-nightly.yml dispatches this on develop (reason=nightly) when evilflowers-worker master
 #                      moved past the :develop image; a failure then opens (or comments) one GitHub issue
 #
-# Every run builds on the evilflowers-worker ref its branch follows (scripts/resolve-worker.sh, the contract of
-# evilflowers-worker#13): develop and PRs the kit's `master`, main and tags its newest release tag v*.*.*, and
-# vars.KIT_REF overrides both. test.yml locks it, tests against it and hands that uv.lock (and pyproject.toml) to
+# Every run builds on the evilflowers-worker ref its branch follows (evilflowers-actions `resolve-worker`, the
+# contract of evilflowers-worker#13): develop and PRs the kit's `master`, main and tags its newest release tag v*.*.*
+# (no tag fails the build), and vars.KIT_REF overrides both. evilflowers-actions is referenced at @master (no
+# release tag yet). test.yml locks it, tests against it and hands that uv.lock (and pyproject.toml) to
 # build-and-push, so the tested and the shipped commit are the same; the resolved lock is never committed.
 #
 # Every image carries the evilflowers-worker commit it was built with: in IMAGE_TAG
 # (`<ref>@<sha>+worker.<short>`, hence OpenTelemetry service.version and every run's provenance) and in
 # the OCI labels `sk.stuba.elvira.evilflowers-worker.revision` and `.ref` (master or the release tag).
 #
-# Every deploy is reported to LGTM by scripts/otlp-deploy.sh (contract: knowledge,
+# Every deploy is reported to LGTM by evilflowers-actions' scripts/otlp-deploy.sh (contract: knowledge,
 # Proposals/CI-Deploy-Unification): a Loki event and a Tempo span `deploy`, service.name github-actions, with
 # evilflowers.deploy.trigger (push / nightly / manual), evilflowers.worker.revision and evilflowers.worker.ref.
 #
@@ -167,28 +168,27 @@ jobs:
     concurrency:
       group: deploy-equation-evilflowers-dev
       cancel-in-progress: false
-    permissions:
-      contents: read               # checkout of scripts/ only
+    permissions: {}
     env:
       NAMESPACE: evilflowers-dev
-      ENVIRONMENT: development     # deployment.environment.name of the target
       # Space-separated Deployments that run this image.
       DEPLOYMENTS: equation
       DIGEST: ${{ needs.build-and-push.outputs.digest }}
       WORKER: ${{ needs.build-and-push.outputs.worker }}
-      # Read by scripts/otlp-deploy.sh.
+      # Read by evilflowers-actions' scripts/otlp-deploy.sh (its input names).
+      TARGET_ENVIRONMENT: development   # deployment.environment.name of the target
+      TARGET_NAMESPACE: evilflowers-dev
+      DEPLOY_DEPLOYMENTS: equation
+      IMAGE: ghcr.io/evilflowerscatalog/evilflowers-equation-service
       WORKER_REVISION: ${{ needs.build-and-push.outputs.worker }}
       WORKER_REF: ${{ needs.build-and-push.outputs.worker-ref }}
       # push / nightly / manual: what started this deploy (evilflowers.deploy.trigger).
       TRIGGER: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || github.event_name }}
+      # evilflowers-actions ref the deploy script is fetched from: @master, as the other evilflowers-actions uses here.
+      ACTIONS_REF: master
       KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
       KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
     steps:
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: scripts
-          persist-credentials: false
-
       # The runner image has no kubectl. The pod is deleted after the job, so nothing is cached.
       - name: kubectl ${{ env.KUBECTL_VERSION }} (checksum-pinned)
         run: |
@@ -231,20 +231,31 @@ jobs:
               failed=1
             fi
           done
+          echo "DEPLOY_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
           exit "$failed"
 
-      # Loki event + Tempo span to the node's Alloy ($ELVIRA_OTLP_HTTP_ENDPOINT on the runner pod). Never fails the
-      # job (the script warns and returns 0). A run cancelled by a newer one reports nothing; the newer run reports
-      # its own.
+      # Loki event + Tempo span to the node's Alloy ($ELVIRA_OTLP_HTTP_ENDPOINT on the runner pod), by the shared
+      # scripts/otlp-deploy.sh of evilflowers-actions (contract: knowledge, Proposals/CI-Deploy-Unification), fetched
+      # the way its reusable deploy.yml does. Never fails the job. A run cancelled by a newer one reports nothing; the
+      # newer run reports its own.
       - name: Report the deploy to LGTM
+        id: otlp
         if: success() || failure()
         env:
-          DEPLOY_STATUS: ${{ job.status == 'success' && 'succeeded' || 'failed' }}
-          WORKFLOW_NAME: ${{ github.workflow }}
-        run: bash scripts/otlp-deploy.sh || echo "::warning::otlp-deploy.sh failed; the deploy itself is unaffected"
+          OUTCOME: ${{ job.status == 'success' && 'succeeded' || 'failed' }}
+        run: |
+          script="$RUNNER_TEMP/otlp-deploy.sh"
+          if curl -fsSL --max-time 20 -o "$script" \
+            "https://raw.githubusercontent.com/EvilFlowersCatalog/evilflowers-actions/${ACTIONS_REF}/scripts/otlp-deploy.sh"; then
+            bash "$script" "$OUTCOME" || echo "::warning::otlp-deploy.sh failed; the deploy itself is unaffected"
+          else
+            echo "::warning::could not fetch otlp-deploy.sh at ${ACTIONS_REF}; deploy event not sent"
+          fi
 
       - name: Summary
         if: always()
+        env:
+          DEPLOY_TRACE_ID: ${{ steps.otlp.outputs.trace_id }}
         run: |
           {
             echo "### Deploy to ${NAMESPACE}: ${{ job.status }} (${TRIGGER})"
@@ -267,31 +278,16 @@ jobs:
 
   # A nightly rebuild that fails (most likely: the new worker breaks lint or tests) leaves :develop and the dev
   # pod on the last worker that passed, and the nightly retries every night. One open issue collects the failures,
-  # a comment per night, instead of a new issue each night.
+  # a comment per night, instead of a new issue each night: "nightly: evilflowers-worker <sha> breaks
+  # evilflowers-equation-service" (evilflowers-actions `report-nightly-failure`).
   report-nightly-failure:
     needs: [test, build-and-push, deploy]
-    # `worker-nightly`: main's copy of worker-nightly.yml (the one the cron runs) still sends it until develop is merged.
-    if: >-
-      failure() && github.event_name == 'workflow_dispatch'
-      && (inputs.reason == 'nightly' || inputs.reason == 'worker-nightly')
+    if: failure() && github.event_name == 'workflow_dispatch' && inputs.reason == 'nightly'
     runs-on: ubuntu-latest
     permissions:
       issues: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      WORKER: ${{ needs.test.outputs.worker }}
-      TITLE: "Nightly: develop fails on the latest evilflowers-worker"
-      RESULTS: "test ${{ needs.test.result }}, build ${{ needs.build-and-push.result }}, deploy ${{ needs.deploy.result }}"
     steps:
-      - run: |
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          body=$(printf 'The nightly rebuild of develop on evilflowers-worker master `%s` failed (%s): %s\n\n:develop and the dev pod keep the last worker that passed; the nightly retries every night.' \
-            "${WORKER:-unknown}" "$RESULTS" "$run_url")
-          number=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number,title \
-            --jq "map(select(.title == \"${TITLE}\")) | .[0].number // empty")
-          if [ -n "$number" ]; then
-            gh issue comment "$number" --body "$body"
-          else
-            gh issue create --title "$TITLE" --body "$body"
-          fi
+      - uses: EvilFlowersCatalog/evilflowers-actions/.github/actions/report-nightly-failure@master
+        with:
+          revision: ${{ needs.test.outputs.worker }}
+          results: test=${{ needs.test.result }} build=${{ needs.build-and-push.result }} deploy=${{ needs.deploy.result }}

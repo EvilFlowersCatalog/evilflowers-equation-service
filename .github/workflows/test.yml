@@ -1,10 +1,14 @@
 # Lint and test against the evilflowers-worker ref this branch follows, for docker-publish.yml.
 #
 # pyproject.toml references the worker by `branch = "master"`. The committed uv.lock only serves local
-# development, so it is never trusted for the worker: scripts/resolve-worker.sh re-locks it first (develop and PRs:
-# the kit's master head; main and tags: its newest release tag v*.*.*; vars.KIT_REF: a hold on that ref), this job
-# tests with that, and uploads the re-locked uv.lock and pyproject.toml as the artifact `uv-lock`. The image is then
-# built from exactly the lock tested here, even if master moves in between.
+# development, so it is never trusted for the worker: the shared `resolve-worker` action of evilflowers-actions
+# re-locks it first (develop and PRs: the kit's master head; main and tags: its newest release tag v*.*.*, and the
+# build fails if there is none; vars.KIT_REF: a hold on that ref), this job tests with that, and uploads the
+# re-locked uv.lock and pyproject.toml as the artifact `uv-lock`. The image is then built from exactly the lock
+# tested here, even if master moves in between.
+#
+# evilflowers-actions is referenced at @master: it has no release tag yet. Move to a tag once it is cut, together
+# with docker-publish.yml and worker-nightly.yml.
 
 name: test
 
@@ -50,14 +54,13 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
-      # Outputs ref (master | v1.2.3) and revision (the commit uv.lock pins). It is the proposed shared
-      # `resolve-worker` action of evilflowers-actions#1.
+      # Outputs ref (master | v1.2.3) and revision (the commit uv.lock pins). Needs uv on PATH (setup-uv above).
       - name: Resolve evilflowers-worker
         id: worker
-        env:
+        uses: EvilFlowersCatalog/evilflowers-actions/.github/actions/resolve-worker@master
+        with:
           # A hold (repository variable): every build uses this kit ref, e.g. a known-good tag while master is broken.
-          KIT_REF: ${{ vars.KIT_REF }}
-        run: bash scripts/resolve-worker.sh
+          kit-ref: ${{ vars.KIT_REF }}
 
       # Core + dev group + rapid-latex-ocr (tests/test_latex.py guards how its ONNX sessions are built);
       # no exporters, no Pyroscope.
