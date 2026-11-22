@@ -23,7 +23,7 @@ check: lint test
 
 # A local worker (needs a reachable REDIS_URL; LATEX_BACKEND=onnx needs `make install-all`).
 worker:
-	uv run celery -A evilflowers_equation.worker worker --loglevel=INFO -E --concurrency=1 --queues=evilflowers_equation
+	uv run celery -A evilflowers_equation.worker worker --loglevel=INFO -E --concurrency=1 --queues=evilflowers.equation,evilflowers_equation
 
 image:
 	docker build --build-arg IMAGE_TAG=local@$$(git rev-parse --short HEAD) -t evilflowers-equation-service:local .

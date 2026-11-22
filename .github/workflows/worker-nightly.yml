@@ -4,9 +4,14 @@
 #     1. read evilflowers-worker master's commit (git ls-remote) and the worker commit of the :develop image
 #        (OCI label sk.stuba.elvira.evilflowers-worker.revision)
 #     2. equal      → nothing (no image, no restart: a Recreate restart costs the model load)
-#        different  → dispatch docker-publish.yml on develop with reason=worker-nightly: it re-locks the worker
+#        different  → dispatch docker-publish.yml on develop with reason=nightly: it re-locks the worker
 #                     to master, tests, builds, pushes :develop, deploys to evilflowers-dev, checks the digest and
-#                     reports the deploy to LGTM; if it fails, it opens (or comments) one GitHub issue
+#                     reports the deploy to LGTM (evilflowers.deploy.trigger=nightly); if it fails, it opens (or
+#                     comments) one GitHub issue
+#        vars.KIT_REF set (a hold) → nothing: :develop is built on that ref and never matches master
+#
+# The unified worker-kit nightly of EvilFlowersCatalog/evilflowers-worker#13 (reference: evilflowers-analyzer-service
+# nightly.yml), until it moves to evilflowers-actions' worker-nightly.yml (evilflowers-actions#1).
 #
 # Why a dispatch and `--ref develop`: `schedule` runs on the default branch (main), so GITHUB_REF is main here,
 # while the build must be develop's and the deploy job only runs for develop.
@@ -42,6 +47,7 @@ jobs:
       IMAGE: ghcr.io/evilflowerscatalog/evilflowers-equation-service:develop
       WORKER_URL: https://github.com/EvilFlowersCatalog/evilflowers-worker
       FORCE: ${{ inputs.force || false }}
+      HOLD: ${{ vars.KIT_REF }}
     steps:
       - uses: docker/login-action@v3
         with:
@@ -61,6 +67,10 @@ jobs:
           echo ":develop was built with:  ${deployed:-unknown (no label)}"
           stale=true
           [ "$master" != "$deployed" ] || stale=false
+          if [ -n "$HOLD" ]; then
+            stale=false
+            echo "::notice::evilflowers-worker is held at ${HOLD} (vars.KIT_REF): nothing to do"
+          fi
           [ "$FORCE" != true ] || stale=true
           {
             echo "master=$master"
@@ -70,7 +80,7 @@ jobs:
 
       - name: Build and deploy develop
         if: steps.compare.outputs.stale == 'true'
-        run: gh workflow run docker-publish.yml --repo "$GITHUB_REPOSITORY" --ref develop -f reason=worker-nightly
+        run: gh workflow run docker-publish.yml --repo "$GITHUB_REPOSITORY" --ref develop -f reason=nightly
 
       - name: Summary
         env:
@@ -84,7 +94,7 @@ jobs:
               echo
               [ -z "$DEPLOYED" ] || echo "${WORKER_URL}/compare/${DEPLOYED}...${MASTER}"
               echo
-              echo "*Docker Build and Push* runs on develop (reason \`worker-nightly\`): test, build, deploy, LGTM event."
+              echo "*Docker Build and Push* runs on develop (reason \`nightly\`): test, build, deploy, LGTM event."
             else
               echo "### :develop already runs evilflowers-worker master \`${MASTER::7}\`: nothing to do"
             fi

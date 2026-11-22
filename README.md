@@ -256,23 +256,28 @@ their defaults and meaning. A deployment sets these:
 
 CI (`.github/workflows/docker-publish.yml`) works like text-service's:
 
-- every run re-locks evilflowers-worker to its `master`, then runs ruff and pytest. The image is built from that
-  tested lock, never from the committed one;
+- every run re-locks evilflowers-worker to the ref its branch follows (`scripts/resolve-worker.sh`, the contract of
+  [evilflowers-worker#13](https://github.com/EvilFlowersCatalog/evilflowers-worker/issues/13)), then runs ruff and
+  pytest. `develop` and PRs follow the kit's `master`. `main` and tags follow its newest release tag `v*.*.*`, and
+  fall back to `master` with a warning if the kit has none. The repository variable `KIT_REF` holds every build on
+  one ref and pauses the nightly. The image is built from that tested lock, never from the committed one;
 - the image is pushed to `ghcr.io/evilflowerscatalog/evilflowers-equation-service` as `:main`, `:develop`, semver
   and `:sha-<short>`;
 - a push to `develop` also restarts the dev Deployment `equation` in `evilflowers-dev`, from the in-cluster runner
   `elvira-k3s`, and checks that the running pod uses the digest it just pushed;
-- every deploy, successful or failed, is reported to LGTM by evilflowers-actions' `scripts/otlp-deploy.sh`. It
-  sends a Loki event `{service_name="github-actions"} | event_name="deployment"` and a Tempo span `deploy`;
+- every deploy, successful or failed, is reported to LGTM by `scripts/otlp-deploy.sh`. It sends a Loki event
+  `{service_name="github-actions"} | event_name="deployment"` and a Tempo span `deploy`, with
+  `evilflowers.deploy.trigger` (`push`, `nightly` or `manual`), `evilflowers.worker.revision` and
+  `evilflowers.worker.ref`;
 - every image records its evilflowers-worker commit in `IMAGE_TAG` (`<ref>@<sha>+worker.<short>`). That puts it in
-  the span resource `service.version` (Tempo) and in every run's provenance. The commit is also in the OCI label
-  `sk.stuba.elvira.evilflowers-worker.revision`.
+  the span resource `service.version` (Tempo) and in every run's provenance. The commit and the kit ref are also in
+  the OCI labels `sk.stuba.elvira.evilflowers-worker.revision` and `sk.stuba.elvira.evilflowers-worker.ref`.
 
 The nightly job (`.github/workflows/worker-nightly.yml`, 02:17 UTC or by hand) keeps the dev deploy on the kit's
 latest `master`. It commits nothing. It compares `master`'s commit with the OCI label of the `:develop` image:
 
 - equal: it does nothing. There is no image and no restart.
-- different: it dispatches this workflow on `develop` with `reason=worker-nightly`, which re-locks, tests, builds,
+- different: it dispatches this workflow on `develop` with `reason=nightly`, which re-locks, tests, builds,
   deploys and reports to LGTM. If that run fails, it opens the issue *Nightly: develop fails on the latest
   evilflowers-worker*, or comments on it if it is already open. `:develop` keeps the last worker that passed, and
   the next night tries again.
@@ -280,8 +285,12 @@ latest `master`. It commits nothing. It compares `master`'s commit with the OCI 
 To rebuild and redeploy without a worker change, run the nightly by hand with `force`.
 
 The image starts the worker as `celery -A evilflowers_equation.worker worker --concurrency=1 -E
---queues=evilflowers_equation`. That is prefork with one child: the model loads once in the child, and Flower can
-inspect the worker during a task.
+--queues=evilflowers.equation,evilflowers_equation`. That is prefork with one child: the model loads once in the
+child, and Flower can inspect the worker during a task. `evilflowers.equation` is the queue name in the
+`evilflowers.<service>` scheme
+([EvilFlowersCatalog/knowledge#14](https://github.com/EvilFlowersCatalog/knowledge/issues/14)), and the analyzer
+sends there now. The legacy `evilflowers_equation` stays consumed until it is empty. After that the image consumes
+`evilflowers.equation` only (#10).
 
 For now the dev Deployment's `args` still copy the old command, `celery --workdir src -A worker`. `src/worker.py`
 keeps that command working. Remove it once the knowledge repo switches the role. That issue also covers the

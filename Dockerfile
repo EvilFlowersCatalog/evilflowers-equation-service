@@ -50,5 +50,7 @@ ENV PATH=/app/.venv/bin:$PATH \
 VOLUME ["/models"]
 
 # Prefork with one child: the model is loaded once in the child, and Flower can inspect the worker during a task.
+# Queues: `evilflowers.equation` (scheme evilflowers.<service>, knowledge#14) next to the legacy `evilflowers_equation`
+# while the analyzer moves its routing; drop the legacy one once it stays empty (#10).
 CMD ["celery", "-A", "evilflowers_equation.worker", "worker", "--loglevel=INFO", "-E", "--concurrency=1", \
-     "--queues=evilflowers_equation"]
+     "--queues=evilflowers.equation,evilflowers_equation"]
