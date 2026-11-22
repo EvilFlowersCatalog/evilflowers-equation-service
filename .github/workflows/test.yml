@@ -1,0 +1,74 @@
+# Lint and test against the latest evilflowers-worker master, for docker-publish.yml.
+#
+# pyproject.toml references the worker by `branch = "master"`. The committed uv.lock only serves local
+# development, so it is never trusted for the worker: this job re-locks it to master's current commit first,
+# tests with that, and uploads the re-locked uv.lock as the artifact `uv-lock`. The image is then built from
+# exactly the lock tested here, even if master moves in between.
+
+name: test
+
+on:
+  workflow_call:
+    outputs:
+      worker:
+        description: evilflowers-worker commit tested (master at the time of the run)
+        value: ${{ jobs.test.outputs.worker }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # tests/test_worker.py runs the image's app as a real prefork worker (evilflowers_worker.testing.WorkerProcess)
+    # against this Redis; with `CI` set it fails instead of skipping when Redis does not answer.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_REDIS_URL: redis://localhost:6379/15
+    outputs:
+      worker: ${{ steps.worker.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      # The worker's commit is the fragment of its locked git source: `…evilflowers-worker?branch=master#<sha>`.
+      - name: Re-lock evilflowers-worker to master
+        id: worker
+        run: |
+          uv lock --upgrade-package evilflowers-worker
+          sha=$(sed -n 's/^source = { git = "[^"]*evilflowers-worker[^"#]*#\([0-9a-f]\{40\}\)".*/\1/p' uv.lock)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "evilflowers-worker: master @ ${sha::7}"
+
+      # Core + dev group + rapid-latex-ocr (tests/test_latex.py guards how its ONNX sessions are built);
+      # no exporters, no Pyroscope.
+      - name: Install
+        run: uv sync --locked --extra onnx --extra check
+      - name: Lint
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Upload the re-locked uv.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: uv-lock
+          path: uv.lock
+          retention-days: 7

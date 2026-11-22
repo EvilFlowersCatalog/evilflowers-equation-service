@@ -5,6 +5,18 @@
 #   tag v*.*.*       → test, push :<version> :sha-<short>         (no deploy)
 #   pull request     → test, build (no push)
 #   manual           → as a push of the chosen ref
+#   worker-nightly   → a manual run on develop (reason=worker-nightly) when evilflowers-worker master moved
+#                      past the :develop image; a failure then opens (or comments) one GitHub issue
+#
+# evilflowers-worker is referenced by its master branch (pyproject.toml): test.yml re-locks it to master's
+# current commit on every run and the image is built from that tested uv.lock, not the committed one.
+#
+# Every image carries the evilflowers-worker commit it was built with: in IMAGE_TAG
+# (`<ref>@<sha>+worker.<short>`, hence OpenTelemetry service.version and every run's provenance) and in
+# the OCI label `sk.stuba.elvira.evilflowers-worker.revision`.
+#
+# Every deploy is reported to LGTM by evilflowers-actions' scripts/otlp-deploy.sh (contract: knowledge,
+# Proposals/CI-Deploy-Unification): a Loki event and a Tempo span `deploy`, service.name github-actions.
 #
 # Deploy (contract: knowledge base, Cookbooks/Deploy-a-Service §4 and CI-Runner): the dev
 # Deployment `equation` runs this image on a floating tag with
@@ -28,6 +40,11 @@ on:
   pull_request:
     branches: [ "main", "develop" ]
   workflow_dispatch:
+    inputs:
+      reason:
+        description: Why the run was started (worker-nightly sets worker-nightly)
+        type: string
+        default: manual
 
 # Concurrency is per job, not per workflow: a newer push to the same ref cancels the older
 # test/build, while `deploy` has its own group that never cancels, so a rollout in progress
@@ -41,41 +58,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Lint and tests against evilflowers-worker master; uploads the re-locked uv.lock.
   test:
-    runs-on: ubuntu-latest
     concurrency:
       group: equation-test-${{ github.ref }}
       cancel-in-progress: true
-    # tests/test_worker.py runs the image's app as a real prefork worker (evilflowers_worker.testing.WorkerProcess)
-    # against this Redis; with `CI` set it fails instead of skipping when Redis does not answer.
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      TEST_REDIS_URL: redis://localhost:6379/15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-          enable-cache: true
-      # Core + dev group + rapid-latex-ocr (tests/test_latex.py guards how its ONNX sessions are built);
-      # no exporters, no Pyroscope.
-      - name: Install
-        run: uv sync --locked --extra onnx --extra check
-      - name: Lint
-        run: |
-          uv run ruff check
-          uv run ruff format --check
-      - name: Test
-        run: uv run pytest -q
+    uses: ./.github/workflows/test.yml
 
   build-and-push:
     needs: test
@@ -88,10 +76,26 @@ jobs:
       packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      worker: ${{ needs.test.outputs.worker }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # The uv.lock test.yml re-locked to evilflowers-worker master and tested, over the committed one: the
+      # image gets exactly the worker that passed, even if master moved since.
+      - uses: actions/download-artifact@v4
+        with:
+          name: uv-lock
+
+      - name: evilflowers-worker revision
+        id: worker
+        env:
+          WORKER: ${{ needs.test.outputs.worker }}
+        run: |
+          test -n "$WORKER"
+          grep -q "evilflowers-worker?branch=master#${WORKER}" uv.lock
+          echo "short=${WORKER::7}" >> "$GITHUB_OUTPUT"
 
       # A buildx builder: the `gha` layer cache needs it.
       - uses: docker/setup-buildx-action@v3
@@ -114,6 +118,8 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha
+          labels: |
+            sk.stuba.elvira.evilflowers-worker.revision=${{ needs.test.outputs.worker }}
 
       - name: Build and push Docker image
         id: build
@@ -127,9 +133,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # Recorded in every extraction run's provenance (IP-018) and as the
-          # OpenTelemetry service.version of the worker.
+          # OpenTelemetry service.version of the worker, with the evilflowers-worker commit.
           build-args: |
-            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}+worker.${{ steps.worker.outputs.short }}
 
       - name: Summary
         if: github.event_name != 'pull_request'
@@ -140,6 +146,7 @@ jobs:
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo "digest: ${{ steps.build.outputs.digest }}"
+            echo "evilflowers-worker: ${{ needs.test.outputs.worker }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -158,6 +165,14 @@ jobs:
       # Space-separated Deployments that run this image.
       DEPLOYMENTS: equation
       DIGEST: ${{ needs.build-and-push.outputs.digest }}
+      WORKER: ${{ needs.build-and-push.outputs.worker }}
+      # Read by scripts/otlp-deploy.sh.
+      TARGET_ENVIRONMENT: development
+      TARGET_NAMESPACE: evilflowers-dev
+      DEPLOY_DEPLOYMENTS: equation
+      IMAGE: ghcr.io/evilflowerscatalog/evilflowers-equation-service
+      # evilflowers-actions has no v1 tag yet: the script at a fixed commit, until this job moves to its deploy.yml.
+      OTLP_DEPLOY_REF: 7d1a7fc27a9e441f928e9fc24352fc58495f6b3e
       KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
       KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
     steps:
@@ -172,6 +187,7 @@ jobs:
       # In-cluster credentials: the pod's ServiceAccount arc-deployer.
       - name: Restart onto the new :develop
         run: |
+          echo "DEPLOY_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
           for deployment in $DEPLOYMENTS; do
             kubectl -n "$NAMESPACE" rollout restart "deployment/$deployment"
           done
@@ -202,15 +218,35 @@ jobs:
               failed=1
             fi
           done
+          echo "DEPLOY_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
           exit "$failed"
+
+      # Loki event + Tempo span to the node's Alloy ($ELVIRA_OTLP_HTTP_ENDPOINT on the runner pod). Never fails the
+      # job. A run cancelled by a newer one reports nothing; the newer run reports its own.
+      - name: Report the deploy to LGTM
+        id: otlp
+        if: success() || failure()
+        env:
+          OUTCOME: ${{ job.status == 'success' && 'succeeded' || 'failed' }}
+        run: |
+          script="$RUNNER_TEMP/otlp-deploy.sh"
+          if curl -fsSL --max-time 20 -o "$script" \
+            "https://raw.githubusercontent.com/EvilFlowersCatalog/evilflowers-actions/${OTLP_DEPLOY_REF}/scripts/otlp-deploy.sh"; then
+            bash "$script" "$OUTCOME" || echo "::warning::otlp-deploy.sh failed; the deploy itself is unaffected"
+          else
+            echo "::warning::could not fetch otlp-deploy.sh at ${OTLP_DEPLOY_REF}; deploy event not sent"
+          fi
 
       - name: Summary
         if: always()
+        env:
+          TRACE_ID: ${{ steps.otlp.outputs.trace_id }}
+          REASON: ${{ inputs.reason || github.event_name }}
         run: |
           {
-            echo "### Deploy to ${NAMESPACE}: ${{ job.status }}"
+            echo "### Deploy to ${NAMESPACE}: ${{ job.status }} (${REASON})"
             echo
-            echo "Digest \`${DIGEST}\`, commit \`${GITHUB_SHA::7}\`."
+            echo "Digest \`${DIGEST}\`, commit \`${GITHUB_SHA::7}\`, evilflowers-worker \`${WORKER::7}\`."
             echo
             echo '```'
             kubectl -n "$NAMESPACE" get pods -o wide \
@@ -218,8 +254,38 @@ jobs:
             echo '```'
             echo
             echo "Grafana (VPN): http://grafana.observability.stu.k8s.internal → Explore"
+            echo "- Deploy event: \`{service_name=\"github-actions\"} | event_name=\"deployment\" | vcs_ref_head_revision=\"${GITHUB_SHA}\"\`${TRACE_ID:+, trace \`${TRACE_ID}\`}"
+            echo "- Running worker: \`{resource.service.name=\"equation\" && resource.service.version=~\".*worker.${WORKER::7}\"}\`"
             echo "- Tempo: \`{resource.service.name=\"equation\" && kind=consumer}\`"
             echo "- Loki: \`{namespace=\"${NAMESPACE}\", service_name=\"equation\"} | json\`"
             echo "- Mimir: \`equation_task_duration_seconds_bucket\`, \`equation_recognition_duration_seconds_bucket\`, \`equation_job_outcome_total\`"
             echo "- Pyroscope: \`{service_name=\"equation\", namespace=\"${NAMESPACE}\"}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # A nightly rebuild that fails (most likely: the new worker breaks lint or tests) leaves :develop and the dev
+  # pod on the last worker that passed, and the nightly retries every night. One open issue collects the failures,
+  # a comment per night, instead of a new issue each night.
+  report-nightly-failure:
+    needs: [test, build-and-push, deploy]
+    if: failure() && inputs.reason == 'worker-nightly'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WORKER: ${{ needs.test.outputs.worker }}
+      TITLE: "Nightly: develop fails on the latest evilflowers-worker"
+      RESULTS: "test ${{ needs.test.result }}, build ${{ needs.build-and-push.result }}, deploy ${{ needs.deploy.result }}"
+    steps:
+      - run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body=$(printf 'The nightly rebuild of develop on evilflowers-worker master `%s` failed (%s): %s\n\n:develop and the dev pod keep the last worker that passed; the nightly retries every night.' \
+            "${WORKER:-unknown}" "$RESULTS" "$run_url")
+          number=$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number,title \
+            --jq "map(select(.title == \"${TITLE}\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi

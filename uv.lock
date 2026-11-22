@@ -277,9 +277,9 @@ dev = [
 requires-dist = [
     { name = "antlr4-python3-runtime", specifier = "==4.11.*" },
     { name = "celery", extras = ["redis"], specifier = ">=5.6,<6" },
-    { name = "evilflowers-worker", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=e530f68d2e3d98519008d39b30fee96f28009834" },
-    { name = "evilflowers-worker", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=e530f68d2e3d98519008d39b30fee96f28009834" },
-    { name = "evilflowers-worker", extras = ["profiling"], marker = "extra == 'profiling'", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=e530f68d2e3d98519008d39b30fee96f28009834" },
+    { name = "evilflowers-worker", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?branch=master" },
+    { name = "evilflowers-worker", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?branch=master" },
+    { name = "evilflowers-worker", extras = ["profiling"], marker = "extra == 'profiling'", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?branch=master" },
     { name = "matplotlib", marker = "extra == 'check'", specifier = ">=3.9" },
     { name = "pillow", specifier = ">=11" },
     { name = "pydantic", specifier = ">=2.12,<3" },
@@ -301,7 +301,7 @@ dev = [
 [[package]]
 name = "evilflowers-worker"
 version = "0.1.0"
-source = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=e530f68d2e3d98519008d39b30fee96f28009834#e530f68d2e3d98519008d39b30fee96f28009834" }
+source = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?branch=master#1887447b9c7af6593101f41bdf628fc688a55fdd" }
 dependencies = [
     { name = "celery", extra = ["redis"] },
     { name = "opentelemetry-api" },

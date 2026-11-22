@@ -13,8 +13,9 @@ The Celery worker that reads formulas. It has two callers:
 - **The books digitalizer.** It runs the catalog-free task `standalone.formulas` (#8): regions of leaf images in,
   LaTeX or text in `formulas.json` out, transcribed by PaddleOCR-VL. See [Standalone formulas](#standalone-formulas).
 
-The worker runtime comes from [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker), pinned
-to a commit in `pyproject.toml` (`[tool.uv.sources]`). The kit provides the message contract, the catalog client,
+The worker runtime comes from [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker). It
+is referenced by its `master` branch (`[tool.uv.sources]`), not by a commit. CI re-locks it to master's current
+commit on every build, so the `uv.lock` entry only serves local development (see [Deployment](#deployment)). The kit provides the message contract, the catalog client,
 the job lifecycle (`LeafJob`), the Celery app, the scale-in shutdown, the delivery cap and the telemetry. Its design
 is in its `docs/architecture.md`. This repository holds only the domain: crops, LaTeX recognition and its thread pool.
 
@@ -226,7 +227,8 @@ The project uses [uv](https://docs.astral.sh/uv/) and Python 3.12. It has four e
 SDK (the last two are the kit's extras). The image installs all four. `tests/test_worker.py` runs the app as a real prefork worker against Redis at
 `TEST_REDIS_URL` (default `redis://localhost:6379/15`) and is skipped without one, except in CI.
 
-To move to a newer kit, change `rev` in `[tool.uv.sources]` and run `uv lock --upgrade-package evilflowers-worker`.
+To get the kit's latest `master` locally, run `uv lock --upgrade-package evilflowers-worker`. CI does the same on
+every build.
 
 ```bash
 make install        # core + dev tools (ruff, pytest): enough for the tests
@@ -254,11 +256,28 @@ their defaults and meaning. A deployment sets these:
 
 CI (`.github/workflows/docker-publish.yml`) works like text-service's:
 
-- every push runs ruff and pytest;
+- every run re-locks evilflowers-worker to its `master`, then runs ruff and pytest. The image is built from that
+  tested lock, never from the committed one;
 - the image is pushed to `ghcr.io/evilflowerscatalog/evilflowers-equation-service` as `:main`, `:develop`, semver
   and `:sha-<short>`;
 - a push to `develop` also restarts the dev Deployment `equation` in `evilflowers-dev`, from the in-cluster runner
-  `elvira-k3s`, and checks that the running pod uses the digest it just pushed.
+  `elvira-k3s`, and checks that the running pod uses the digest it just pushed;
+- every deploy, successful or failed, is reported to LGTM by evilflowers-actions' `scripts/otlp-deploy.sh`. It
+  sends a Loki event `{service_name="github-actions"} | event_name="deployment"` and a Tempo span `deploy`;
+- every image records its evilflowers-worker commit in `IMAGE_TAG` (`<ref>@<sha>+worker.<short>`). That puts it in
+  the span resource `service.version` (Tempo) and in every run's provenance. The commit is also in the OCI label
+  `sk.stuba.elvira.evilflowers-worker.revision`.
+
+The nightly job (`.github/workflows/worker-nightly.yml`, 02:17 UTC or by hand) keeps the dev deploy on the kit's
+latest `master`. It commits nothing. It compares `master`'s commit with the OCI label of the `:develop` image:
+
+- equal: it does nothing. There is no image and no restart.
+- different: it dispatches this workflow on `develop` with `reason=worker-nightly`, which re-locks, tests, builds,
+  deploys and reports to LGTM. If that run fails, it opens the issue *Nightly: develop fails on the latest
+  evilflowers-worker*, or comments on it if it is already open. `:develop` keeps the last worker that passed, and
+  the next night tries again.
+
+To rebuild and redeploy without a worker change, run the nightly by hand with `force`.
 
 The image starts the worker as `celery -A evilflowers_equation.worker worker --concurrency=1 -E
 --queues=evilflowers_equation`. That is prefork with one child: the model loads once in the child, and Flower can

@@ -1,0 +1,96 @@
+# Keep the dev deploy on the latest evilflowers-worker master. Commits nothing.
+#
+#   every night, or by hand
+#     1. read evilflowers-worker master's commit (git ls-remote) and the worker commit of the :develop image
+#        (OCI label sk.stuba.elvira.evilflowers-worker.revision)
+#     2. equal      → nothing (no image, no restart: a Recreate restart costs the model load)
+#        different  → dispatch docker-publish.yml on develop with reason=worker-nightly: it re-locks the worker
+#                     to master, tests, builds, pushes :develop, deploys to evilflowers-dev, checks the digest and
+#                     reports the deploy to LGTM; if it fails, it opens (or comments) one GitHub issue
+#
+# Why a dispatch and `--ref develop`: `schedule` runs on the default branch (main), so GITHUB_REF is main here,
+# while the build must be develop's and the deploy job only runs for develop.
+# A schedule only fires from the default branch's copy of this file: it is live once this file is on main.
+
+name: Nightly evilflowers-worker
+
+on:
+  schedule:
+    - cron: "17 2 * * *"           # 02:17 UTC, outside the working day; not on the hour (GitHub's busiest minute)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and redeploy even if :develop already has master's worker
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-nightly
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read                 # inspect :develop on GHCR
+      actions: write                 # dispatch docker-publish.yml
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ghcr.io/evilflowerscatalog/evilflowers-equation-service:develop
+      WORKER_URL: https://github.com/EvilFlowersCatalog/evilflowers-worker
+      FORCE: ${{ inputs.force || false }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Compare master with :develop
+        id: compare
+        run: |
+          master=$(git ls-remote "$WORKER_URL" refs/heads/master | cut -f1)
+          test -n "$master"
+          # The label is in the image config; grep the whole inspect output, whatever shape the index has.
+          deployed=$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image}}' 2>/dev/null \
+            | grep -o '"sk.stuba.elvira.evilflowers-worker.revision":"[0-9a-f]\{40\}"' | head -n1 | cut -d'"' -f4 || true)
+          echo "evilflowers-worker master: ${master}"
+          echo ":develop was built with:  ${deployed:-unknown (no label)}"
+          stale=true
+          [ "$master" != "$deployed" ] || stale=false
+          [ "$FORCE" != true ] || stale=true
+          {
+            echo "master=$master"
+            echo "deployed=$deployed"
+            echo "stale=$stale"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and deploy develop
+        if: steps.compare.outputs.stale == 'true'
+        run: gh workflow run docker-publish.yml --repo "$GITHUB_REPOSITORY" --ref develop -f reason=worker-nightly
+
+      - name: Summary
+        env:
+          MASTER: ${{ steps.compare.outputs.master }}
+          DEPLOYED: ${{ steps.compare.outputs.deployed }}
+          STALE: ${{ steps.compare.outputs.stale }}
+        run: |
+          {
+            if [ "$STALE" = true ]; then
+              echo "### evilflowers-worker \`${DEPLOYED:-unknown}\` → \`${MASTER::7}\`: rebuild dispatched"
+              echo
+              [ -z "$DEPLOYED" ] || echo "${WORKER_URL}/compare/${DEPLOYED}...${MASTER}"
+              echo
+              echo "*Docker Build and Push* runs on develop (reason \`worker-nightly\`): test, build, deploy, LGTM event."
+            else
+              echo "### :develop already runs evilflowers-worker master \`${MASTER::7}\`: nothing to do"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STALE" = true ]; then
+            echo "::notice::evilflowers-worker ${DEPLOYED::7} → ${MASTER::7}: rebuild of develop dispatched"
+          else
+            echo "::notice:::develop already runs evilflowers-worker ${MASTER::7}"
+          fi
